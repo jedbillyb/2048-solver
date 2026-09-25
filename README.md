@@ -27,6 +27,8 @@ Weights live in `nets/` (gitignored, ~270 MB each).
 | Same net + expectimax depth 2 | 8 | 125,954 | 100% | 62.5% | 0% |
 | Net after 3M games, 1-ply greedy | last 10k | 162,533 | 94.1% | 78.1% | 24.8% |
 | Same net + expectimax depth 2 | 32 | 298,250 | 100% | 100% | 81.2% |
+| 3-stage net, +1.7M games with endgame restarts, depth 2 | 32 | 336,879 | 100% | 100% | 93.8% |
+| Same, depth 3 | 8 | 304,457 | 100% | 100% | 75.0% |
 
-None of these reach 32768 yet. Next: a 3-stage network (separate weights once 16384 / 32768
-appear) trained with restarts from saved endgame boards (`train --stages 3 --restart 0.5`).
+32768 column is 0% everywhere so far: games top out around 360-386k, just before the
+final merge chain. Next: the 8-tuple network (`--tuples 8`), then stages + restarts on top.
