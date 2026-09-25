@@ -706,15 +706,12 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
     let c = Client { url: url.trim_end_matches('/').to_string(), auth: format!("Authorization: Bearer {token}"), tmp: cache.clone() };
     let cached = cache.join("net.bin");
     let cached_seq = cache.join("net.seq");
-    // On a Windows desktop, training at full priority on every core freezes the UI:
-    // leave one core free and drop below normal so the machine stays usable.
+    // Below normal priority still uses every core when the machine is idle, but lets the
+    // Windows desktop take the CPU when it needs it instead of freezing.
     #[cfg(windows)]
-    let threads = {
-        let _ = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &format!("(Get-Process -Id {}).PriorityClass='BelowNormal'", std::process::id())])
-            .status();
-        threads.saturating_sub(1).max(1)
-    };
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &format!("(Get-Process -Id {}).PriorityClass='BelowNormal'", std::process::id())])
+        .status();
     eprintln!("worker {me} using {threads} threads");
     let status = Arc::new(Mutex::new("starting"));
     {
