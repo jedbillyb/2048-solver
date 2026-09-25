@@ -91,7 +91,6 @@ fn pick_largest(mut raw: Vec<(u32, f32)>, budget_bytes: f64) -> Vec<(u32, f32)> 
 }
 
 /// Job settings as `key=value` lines.
-#[cfg_attr(not(windows), allow(dead_code))]
 fn job_text<'a>(job: &'a str, key: &str) -> Option<&'a str> {
     job.lines().find_map(|l| Some(l.strip_prefix(key)?.strip_prefix('=')?.trim()))
 }
@@ -202,9 +201,29 @@ impl Coord {
         eprintln!("saved master at seq {} in {:.1}s", self.seq, t.elapsed().as_secs_f64());
     }
 
+    /// The job as workers see it. With `schedule=otd`, alpha and TC follow the OTD recipe
+    /// over the stage's `goal` episodes: per-weight alpha 0.1/64, cut 10x at 50% and again at
+    /// 75%, then TC learning (alpha 1.0/64) for the last 10%.
+    fn effective_job(&self) -> String {
+        if job_text(&self.job, "schedule") != Some("otd") {
+            return self.job.clone();
+        }
+        let done = self.episodes as f64 / job_value(&self.job, "goal").unwrap_or(100e6);
+        let (alpha, tc) = match done {
+            d if d < 0.5 => (0.1, 0),
+            d if d < 0.75 => (0.01, 0),
+            d if d < 0.9 => (0.001, 0),
+            _ => (1.0, 1),
+        };
+        let mut out: String = self.job.lines().filter(|l| !l.starts_with("alpha=") && !l.starts_with("tc=")).map(|l| format!("{l}\n")).collect();
+        out += &format!("alpha={}\ntc={tc}\n", alpha / 64.0);
+        out
+    }
+
     fn status(&self, color: bool) -> String {
         let paint = |code: &str, text: String| if color { format!("\x1b[{code}m{text}\x1b[0m") } else { text };
-        let job = |k: &str| job_value(&self.job, k);
+        let effective = self.effective_job();
+        let job = |k: &str| job_value(&effective, k);
         let mut s = String::new();
 
         // Headline: progress towards the episode goal of this training stage.
@@ -215,8 +234,9 @@ impl Coord {
         let bar = (done * 30.0).round() as usize;
         let eta = if rate > 0.0 { duration((goal - self.episodes as f64).max(0.0) / rate) } else { "-".into() };
         s += &paint("1", "2048 TRAINING FARM".into());
-        s += &format!("   alpha {}   TC {}{}\n",
+        s += &format!("   alpha {}{}   TC {}{}\n",
             job("alpha").unwrap_or(0.0),
+            if job_text(&self.job, "schedule") == Some("otd") { " (auto: OTD schedule)" } else { "" },
             if job("tc").unwrap_or(0.0) > 0.0 { "on" } else { "off" },
             if job("pause").unwrap_or(0.0) > 0.0 { paint("33", "   PAUSED".into()) } else { String::new() });
         s += &format!("progress  {}{}  {:.1}%  {} / {} games  ETA {eta}\n\n",
@@ -377,7 +397,7 @@ fn handle(mut stream: TcpStream, coord: &Mutex<Coord>, token: &str) -> std::io::
     let (path, q) = parse_query(&target);
     match (method.as_str(), path.as_str()) {
         ("GET", "/job") => {
-            let job = coord.lock().unwrap().job.clone();
+            let job = coord.lock().unwrap().effective_job();
             respond(&mut stream, 200, job.as_bytes());
         }
         ("POST", "/job") => {
