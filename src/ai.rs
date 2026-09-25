@@ -25,6 +25,8 @@ pub struct Ai {
     depth: Option<u32>,
     /// Deeper search once a 16384 is on the board, where the final merge chain is won or lost.
     endgame_depth: Option<u32>,
+    /// Branches less likely than this are cut off and scored by the evaluator directly.
+    cprob_thresh: f32,
 }
 
 struct Search<'a> {
@@ -68,11 +70,18 @@ fn row_heur(row: u16) -> f32 {
 
 impl Ai {
     pub fn new() -> Self {
-        Ai { t: Tables::new(), heur: (0..=u16::MAX).map(row_heur).collect(), net: None, depth: None, endgame_depth: None }
+        Ai { t: Tables::new(), heur: (0..=u16::MAX).map(row_heur).collect(), net: None, depth: None, endgame_depth: None, cprob_thresh: CPROB_THRESH }
     }
 
     pub fn with_net(net: Arc<NTuple>, depth: u32) -> Self {
         Ai { net: Some(net), depth: Some(depth.max(1)), ..Ai::new() }
+    }
+
+    pub fn with_cprob(mut self, c: Option<f32>) -> Self {
+        if let Some(c) = c {
+            self.cprob_thresh = c;
+        }
+        self
     }
 
     pub fn with_endgame_depth(mut self, d: Option<u32>) -> Self {
@@ -122,7 +131,7 @@ impl Ai {
 
 impl Search<'_> {
     fn chance(&mut self, b: Board, cprob: f32, depth: u32) -> f32 {
-        if cprob < CPROB_THRESH || depth >= self.depth_limit {
+        if cprob < self.ai.cprob_thresh || depth >= self.depth_limit {
             return self.ai.eval(b);
         }
         if depth < CACHE_DEPTH_LIMIT {

@@ -10,6 +10,8 @@ use std::time::Instant;
 
 const USAGE: &str = "usage:
   g2048 bench [games=16] [seed=1] [--net FILE --depth N [--endgame-depth N]]
+  g2048 positions OUT_FILE [count=64] --net FILE [--depth 2]   (boards where 16384 first appears)
+  g2048 endgame POS_FILE --net FILE [--depth N] [--cprob P]     (play saved boards to the end)
   g2048 serve --net FILE [--depth N] [--port 20480]
   g2048 train OUT_FILE [games=1000000] [--resume FILE] [--alpha A] [--seed S] [--tc 1] [--stages 3] [--restart 0.5] [--tuples 4|8]";
 
@@ -77,6 +79,103 @@ fn report(results: &[GameResult], secs: f64, threads: usize) {
     }
     let won = results.iter().filter(|r| r.won_65536).count();
     println!("reached 65536: {:>5.1}%", 100.0 * won as f64 / n);
+}
+
+/// Net-backed AI from --net / --depth / --endgame-depth / --cprob.
+fn net_ai(args: &[String], default_depth: u32) -> ai::Ai {
+    let path: String = flag(args, "--net").unwrap_or_else(|| panic!("{USAGE}"));
+    let net = NTuple::load(&path).unwrap_or_else(|e| panic!("loading {path}: {e}"));
+    ai::Ai::with_net(Arc::new(net), flag(args, "--depth").unwrap_or(default_depth))
+        .with_endgame_depth(flag(args, "--endgame-depth"))
+        .with_cprob(flag(args, "--cprob"))
+}
+
+/// Runs `job(i)` for i in 0..n across all cores, returning results in index order.
+fn parallel<T: Send + 'static>(n: u64, job: impl Fn(u64) -> T + Send + Sync + 'static) -> Vec<T> {
+    let job = Arc::new(job);
+    let next = Arc::new(AtomicU64::new(0));
+    let handles: Vec<_> = (0..threads(n))
+        .map(|_| {
+            let (job, next) = (job.clone(), next.clone());
+            std::thread::spawn(move || {
+                let mut out = vec![];
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= n {
+                        break out;
+                    }
+                    out.push((i, job(i)));
+                }
+            })
+        })
+        .collect();
+    let mut all: Vec<(u64, T)> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+    all.sort_by_key(|(i, _)| *i);
+    all.into_iter().map(|(_, t)| t).collect()
+}
+
+/// Plays fresh games and keeps the board right after 16384 first appears.
+fn positions(args: &[String]) {
+    let pos = positional(args);
+    let out = pos.first().unwrap_or_else(|| panic!("{USAGE}")).to_string();
+    let count: u64 = pos.get(1).and_then(|s| s.parse().ok()).unwrap_or(64);
+    let ai = Arc::new(net_ai(args, 2));
+    let found = parallel(count * 2, move |i| {
+        let mut rng = Rng((5000 + i).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut b = spawn(spawn(0, &mut rng), &mut rng);
+        while let Some(d) = ai.best_move(b) {
+            b = spawn(ai.tables().apply(b, d).0, &mut rng);
+            if max_rank(b) >= 14 {
+                return Some(b);
+            }
+        }
+        None
+    });
+    let boards: Vec<Board> = found.into_iter().flatten().take(count as usize).collect();
+    let text: String = boards.iter().map(|b| format!("{b:016x}\n")).collect();
+    std::fs::write(&out, text).expect("writing positions");
+    println!("saved {} boards to {out}", boards.len());
+}
+
+/// Plays each saved board to the end and reports how often 32768 / 65536 follow.
+fn endgame(args: &[String]) {
+    let pos = positional(args);
+    let file = pos.first().unwrap_or_else(|| panic!("{USAGE}"));
+    let boards: Vec<Board> = std::fs::read_to_string(file)
+        .expect("reading positions")
+        .lines()
+        .filter_map(|l| u64::from_str_radix(l.trim(), 16).ok())
+        .collect();
+    let ai = Arc::new(net_ai(args, 2));
+    let start = Instant::now();
+    let n = boards.len() as u64;
+    let boards = Arc::new(boards);
+    let results = parallel(n, move |i| {
+        let mut rng = Rng((9000 + i).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut b = boards[i as usize];
+        let (mut moves, mut won) = (0u64, false);
+        while let Some(d) = ai.best_move(b) {
+            let nb = ai.tables().apply(b, d).0;
+            moves += 1;
+            if made_65536(b, nb) {
+                won = true;
+                break;
+            }
+            b = spawn(nb, &mut rng);
+        }
+        (max_rank(b), won, moves)
+    });
+    let pct = |f: &dyn Fn(&(u8, bool, u64)) -> bool| 100.0 * results.iter().filter(|r| f(r)).count() as f64 / n as f64;
+    let moves: u64 = results.iter().map(|r| r.2).sum();
+    println!(
+        "{} boards  32768 {:>5.1}%  65536 {:>5.1}%  avg moves {:.0}  {:.0}s ({:.0} moves/s)",
+        n,
+        pct(&|r| r.0 >= 15),
+        pct(&|r| r.1),
+        moves as f64 / n as f64,
+        start.elapsed().as_secs_f64(),
+        moves as f64 / start.elapsed().as_secs_f64()
+    );
 }
 
 fn bench(args: &[String]) {
@@ -244,6 +343,8 @@ fn main() {
         Some("bench") => bench(&args[1..]),
         Some("train") => train(&args[1..]),
         Some("serve") => serve(&args[1..]),
+        Some("positions") => positions(&args[1..]),
+        Some("endgame") => endgame(&args[1..]),
         _ => eprintln!("{USAGE}"),
     }
 }
