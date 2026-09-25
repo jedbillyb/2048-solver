@@ -150,6 +150,10 @@ fn endgame(args: &[String]) {
     let start = Instant::now();
     let n = boards.len() as u64;
     let boards = Arc::new(boards);
+    // status.sh reads this to show progress.
+    let progress = format!("/tmp/g2048-progress-{}", std::process::id());
+    let done = Arc::new(AtomicU64::new(0));
+    let (progress2, done2) = (progress.clone(), done.clone());
     let results = parallel(n, move |i| {
         let mut rng = Rng((9000 + i).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let mut b = boards[i as usize];
@@ -163,8 +167,11 @@ fn endgame(args: &[String]) {
             }
             b = spawn(nb, &mut rng);
         }
+        let k = done2.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = std::fs::write(&progress2, format!("{k}/{n} boards done"));
         (max_rank(b), won, moves)
     });
+    let _ = std::fs::remove_file(&progress);
     let pct = |f: &dyn Fn(&(u8, bool, u64)) -> bool| 100.0 * results.iter().filter(|r| f(r)).count() as f64 / n as f64;
     let moves: u64 = results.iter().map(|r| r.2).sum();
     println!(
