@@ -28,17 +28,10 @@ set_job() {
 worker_pid() { pgrep -f "release/g2048 worker" || true; }
 
 overview() {
-    echo "== 2048-solver farm  $(date +%H:%M:%S) =="
-    if ! api -f --max-time 10 "$URL/status" 2>/dev/null; then
+    if ! api -f --max-time 10 "$URL/status?color=1" 2>/dev/null; then
         echo "server coordinator not reachable (not started yet, or down)"
     fi
-    echo
-    if [ -n "$(worker_pid)" ]; then
-        echo "this laptop: worker running, last lines:"
-        tail -n 3 "$CACHE/worker.log" 2>/dev/null | sed 's/^/  /'
-    else
-        echo "this laptop: worker NOT running (start it: farm.sh start)"
-    fi
+    [ -n "$(worker_pid)" ] || printf '\n\033[33mthis laptop: worker NOT running (start it: farm start)\033[0m\n'
 }
 
 case "$1" in

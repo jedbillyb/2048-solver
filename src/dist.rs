@@ -133,18 +133,6 @@ impl Chunk {
     fn rate(&self) -> f64 {
         if self.secs > 0.0 { self.episodes as f64 / self.secs } else { 0.0 }
     }
-
-    fn line(&self, name: &str, seen: String, rate: f64) -> String {
-        let pct = |x: u64| if self.fresh == 0 { 0.0 } else { 100.0 * x as f64 / self.fresh as f64 };
-        let r = self.reached;
-        format!(
-            "{name:<22}{seen:>6}{:>9.0}{:>9}{:>9.0}{:>7.1}{:>7.1}{:>7.1}{:>7.1}{:>7.2}\n",
-            rate,
-            self.fresh,
-            if self.fresh == 0 { 0.0 } else { self.score as f64 / self.fresh as f64 },
-            pct(r[0]), pct(r[1]), pct(r[2]), pct(r[3]), pct(r[4])
-        )
-    }
 }
 
 // ---------------------------------------------------------------- coordinator
@@ -160,6 +148,14 @@ struct WorkerInfo {
     last_seen: Instant,
     recent: VecDeque<Chunk>,
     total_episodes: u64,
+    /// The latest heartbeat: what the worker is doing plus its machine's load.
+    beat: Option<(Instant, HashMap<String, String>)>,
+}
+
+impl WorkerInfo {
+    fn new() -> WorkerInfo {
+        WorkerInfo { last_seen: Instant::now(), recent: VecDeque::new(), total_episodes: 0, beat: None }
+    }
 }
 
 struct Coord {
@@ -172,6 +168,8 @@ struct Coord {
     log_bytes: usize,
     job: String,
     workers: HashMap<String, WorkerInfo>,
+    /// Training games since the net was created, kept in `path.episodes` across restarts.
+    episodes: u64,
 }
 
 impl Coord {
@@ -185,6 +183,7 @@ impl Coord {
             return;
         }
         let _ = std::fs::write(format!("{}.seq", self.path), self.seq.to_string());
+        let _ = std::fs::write(format!("{}.episodes", self.path), self.episodes.to_string());
         self.saved_seq = self.seq;
         self.saved_at = Instant::now();
         // Only deltas the saved file already holds may go, and only when over budget.
@@ -198,37 +197,114 @@ impl Coord {
         eprintln!("saved master at seq {} in {:.1}s", self.seq, t.elapsed().as_secs_f64());
     }
 
-    fn status(&self) -> String {
-        let mut s = format!(
-            "master seq {}  saved seq {} ({}s ago)  holding {} deltas ({} MB)\njob: {}\n\n",
-            self.seq,
-            self.saved_seq,
-            self.saved_at.elapsed().as_secs(),
-            self.log.len(),
-            self.log_bytes >> 20,
-            self.job.trim().replace('\n', "  ")
-        );
-        s += &format!("{:<22}{:>6}{:>9}{:>9}{:>9}{:>7}{:>7}{:>7}{:>7}{:>7}\n", "worker", "seen", "games/s", "fresh", "mean", "2048", "4096", "8192", "16384", "32768");
+    fn status(&self, color: bool) -> String {
+        let paint = |code: &str, text: String| if color { format!("\x1b[{code}m{text}\x1b[0m") } else { text };
+        let job = |k: &str| job_value(&self.job, k);
+        let mut s = String::new();
+
+        // Headline: progress towards the episode goal of this training stage.
+        let live = |w: &WorkerInfo| w.last_seen.elapsed() < Duration::from_secs(600);
+        let rate: f64 = self.workers.values().filter(|w| live(w)).map(recent_rate).sum();
+        let goal = job("goal").unwrap_or(100e6);
+        let done = (self.episodes as f64 / goal).min(1.0);
+        let bar = (done * 30.0).round() as usize;
+        let eta = if rate > 0.0 { duration((goal - self.episodes as f64).max(0.0) / rate) } else { "-".into() };
+        s += &paint("1", "2048 TRAINING FARM".into());
+        s += &format!("   alpha {}   TC {}{}\n",
+            job("alpha").unwrap_or(0.0),
+            if job("tc").unwrap_or(0.0) > 0.0 { "on" } else { "off" },
+            if job("pause").unwrap_or(0.0) > 0.0 { paint("33", "   PAUSED".into()) } else { String::new() });
+        s += &format!("progress  {}{}  {:.1}%  {} / {} games  ETA {eta}\n\n",
+            paint("32", "#".repeat(bar)), paint("2", ".".repeat(30 - bar)), done * 100.0,
+            millions(self.episodes as f64), millions(goal));
+
+        // Machines: what each is doing and how hard it is working.
         let mut names: Vec<_> = self.workers.keys().collect();
         names.sort();
-        // Rates add across machines; score and reach percentages pool their fresh games.
-        let (mut total, mut rate) = (Chunk::default(), 0.0);
-        for name in names {
-            let w = &self.workers[name];
+        s += &paint("1", format!("{:<12}{:<15}{:>6}{:>8}{:>20}{:>9}", "MACHINE", "STATUS", "CPU", "TEMP", "RAM used/total", "g2048"));
+        s += "\n";
+        for name in &names {
+            let w = &self.workers[*name];
+            let (state, cpu, temp, ram, rss) = match &w.beat {
+                Some((at, b)) if at.elapsed() < Duration::from_secs(60) => {
+                    let num = |k: &str| b.get(k).and_then(|v| v.parse::<f64>().ok());
+                    let state = b.get("state").cloned().unwrap_or_default();
+                    let state = match state.as_str() {
+                        "training" => paint("32", format!("{:<15}", "* training")),
+                        _ => paint("33", format!("{:<15}", format!("* {state}"))),
+                    };
+                    let cpu = num("cpu").map_or(format!("{:>6}", "-"), |c| format!("{:>5.0}%", c));
+                    let temp = match num("temp") {
+                        Some(t) => paint(if t >= 95.0 { "31" } else if t >= 85.0 { "33" } else { "32" }, format!("{:>7.0}C", t)),
+                        None => format!("{:>8}", "n/a"),
+                    };
+                    let ram = match (num("ram"), num("ramtot")) {
+                        (Some(u), Some(t)) => {
+                            let text = format!("{:>20}", format!("{:.1} / {:.1} GB", u / 1024.0, t / 1024.0));
+                            if u / t > 0.9 { paint("31", text) } else { text }
+                        }
+                        _ => format!("{:>20}", "-"),
+                    };
+                    let rss = num("rss").map_or(format!("{:>9}", "-"), |r| format!("{:>9}", format!("{:.1} GB", r / 1024.0)));
+                    (state, cpu, temp, ram, rss)
+                }
+                Some((at, _)) => (paint("31", format!("{:<15}", format!("OFFLINE {}", duration(at.elapsed().as_secs_f64())))), String::new(), String::new(), String::new(), String::new()),
+                None => (paint("33", format!("{:<15}", "old worker")), format!("{:>6}", "?"), format!("{:>8}", "?"), format!("{:>20}", "update the exe"), String::new()),
+            };
+            s += &format!("{:<12}{state}{cpu}{temp}{ram}{rss}\n", name);
+        }
+
+        // Training results, from each worker's recent chunks.
+        s += "\n";
+        s += &paint("1", format!("{:<12}{:>9}{:>12}{:>8}{:>8}{:>8}{:>8}{:>8}", "RESULTS", "games/s", "mean score", "2048", "4096", "8192", "16384", "32768"));
+        s += "\n";
+        let row = |label: &str, c: &Chunk, rate: f64| {
+            let pct = |x: u64| if c.fresh == 0 { 0.0 } else { 100.0 * x as f64 / c.fresh as f64 };
+            let r = c.reached;
+            let mean = if c.fresh == 0 { 0.0 } else { c.score as f64 / c.fresh as f64 };
+            format!("{label:<12}{:>9}{:>12}{:>7.1}%{:>7.1}%{:>7.1}%{:>7.2}%{:>7.2}%\n",
+                thousands(rate), thousands(mean), pct(r[0]), pct(r[1]), pct(r[2]), pct(r[3]), pct(r[4]))
+        };
+        let mut total = Chunk::default();
+        for name in &names {
+            let w = &self.workers[*name];
+            if w.recent.is_empty() {
+                continue;
+            }
             let mut sum = Chunk::default();
             w.recent.iter().for_each(|c| sum.add(c));
-            let seen = w.last_seen.elapsed().as_secs();
-            s += &sum.line(name, format!("{seen}s"), sum.rate());
-            if seen < 600 {
+            s += &row(name, &sum, if live(w) { sum.rate() } else { 0.0 });
+            if live(w) {
                 total.add(&sum);
-                rate += sum.rate();
             }
         }
-        s += &total.line("ALL (live)", String::new(), rate);
-        let episodes: u64 = self.workers.values().map(|w| w.total_episodes).sum();
-        s += &format!("\n{episodes} training games since the coordinator started\n");
+        s += &paint("1", row("ALL", &total, rate));
+        s += &paint("2", format!(
+            "\nmaster: update {}, saved {} ago, {} updates held ({} MB). Scores are over each machine's last {RECENT} chunks.\n",
+            self.seq, duration(self.saved_at.elapsed().as_secs_f64()), self.log.len(), self.log_bytes >> 20));
         s
     }
+}
+
+fn duration(secs: f64) -> String {
+    let m = (secs / 60.0) as u64;
+    if m >= 60 { format!("{}h {:02}m", m / 60, m % 60) } else if m > 0 { format!("{m}m") } else { format!("{}s", secs as u64) }
+}
+
+fn millions(x: f64) -> String {
+    if x >= 1e6 { format!("{:.1}M", x / 1e6) } else { format!("{:.0}k", x / 1e3) }
+}
+
+fn thousands(x: f64) -> String {
+    let digits = format!("{:.0}", x);
+    let mut out = String::new();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn recent_rate(w: &WorkerInfo) -> f64 {
@@ -306,8 +382,14 @@ fn handle(mut stream: TcpStream, coord: &Mutex<Coord>, token: &str) -> std::io::
             respond(&mut stream, 200, c.job.as_bytes());
         }
         ("GET", "/status") => {
-            let s = coord.lock().unwrap().status();
+            let s = coord.lock().unwrap().status(q.contains_key("color"));
             respond(&mut stream, 200, s.as_bytes());
+        }
+        ("POST", "/beat") => {
+            let name = q.get("name").cloned().unwrap_or_default();
+            let mut c = coord.lock().unwrap();
+            c.workers.entry(name).or_insert_with(WorkerInfo::new).beat = Some((Instant::now(), q));
+            respond(&mut stream, 200, b"ok\n");
         }
         ("GET", "/net") => {
             // Open under the lock so the file and its seq match even if a save lands mid-download.
@@ -356,7 +438,8 @@ fn handle(mut stream: TcpStream, coord: &Mutex<Coord>, token: &str) -> std::io::
             let name = q.get("name").cloned().unwrap_or_else(|| me.clone());
             let chunk = Chunk::from_query(&q);
             let mut c = coord.lock().unwrap();
-            let w = c.workers.entry(name.clone()).or_insert(WorkerInfo { last_seen: Instant::now(), recent: VecDeque::new(), total_episodes: 0 });
+            c.episodes += chunk.episodes;
+            let w = c.workers.entry(name.clone()).or_insert_with(WorkerInfo::new);
             w.last_seen = Instant::now();
             w.total_episodes += chunk.episodes;
             w.recent.push_back(chunk);
@@ -387,6 +470,7 @@ pub fn coord(net_path: String, token: String, port: u16) {
     let net = NTuple::load(&net_path).unwrap_or_else(|e| panic!("loading {net_path}: {e}"));
     let seq: u64 = std::fs::read_to_string(format!("{net_path}.seq")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
     let job = std::fs::read_to_string(format!("{net_path}.job")).unwrap_or_else(|_| DEFAULT_JOB.to_string());
+    let episodes: u64 = std::fs::read_to_string(format!("{net_path}.episodes")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
     let coord = Arc::new(Mutex::new(Coord {
         net,
         path: net_path,
@@ -397,6 +481,7 @@ pub fn coord(net_path: String, token: String, port: u16) {
         log_bytes: 0,
         job,
         workers: HashMap::new(),
+        episodes,
     }));
     let saver = coord.clone();
     std::thread::spawn(move || loop {
@@ -418,6 +503,7 @@ pub fn coord(net_path: String, token: String, port: u16) {
 
 // ---------------------------------------------------------------- worker
 
+#[derive(Clone)]
 struct Client {
     url: String,
     auth: String,
@@ -498,6 +584,107 @@ fn add_into(v: &mut [f32], delta: &[(u32, f32)]) {
     }
 }
 
+/// Machine load for the status page, as query pairs: cpu (%), temp (C), ram, ramtot and
+/// rss (this process) in MiB. Anything the OS won't tell us is left out.
+#[cfg_attr(windows, allow(dead_code))]
+struct SysSampler {
+    last_cpu: Option<(u64, u64)>,
+}
+
+impl SysSampler {
+    #[cfg(not(windows))]
+    fn sample(&mut self) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        // cpu: busy share of all jiffies since the previous sample.
+        if let Some(line) = std::fs::read_to_string("/proc/stat").ok().and_then(|s| s.lines().next().map(String::from)) {
+            let v: Vec<u64> = line.split_whitespace().skip(1).filter_map(|x| x.parse().ok()).collect();
+            let total: u64 = v.iter().take(8).sum();
+            let idle = v.get(3).unwrap_or(&0) + v.get(4).unwrap_or(&0);
+            if let Some((t0, i0)) = self.last_cpu.replace((total, idle)) {
+                if total > t0 {
+                    out.push(("cpu", format!("{:.0}", 100.0 * (1.0 - (idle - i0) as f64 / (total - t0) as f64))));
+                }
+            }
+        }
+        let kb = |file: &str, key: &str| -> Option<f64> {
+            let s = std::fs::read_to_string(file).ok()?;
+            s.lines().find_map(|l| l.strip_prefix(key)?.split_whitespace().next()?.parse().ok())
+        };
+        if let (Some(t), Some(a)) = (kb("/proc/meminfo", "MemTotal:"), kb("/proc/meminfo", "MemAvailable:")) {
+            out.push(("ram", format!("{:.0}", (t - a) / 1024.0)));
+            out.push(("ramtot", format!("{:.0}", t / 1024.0)));
+        }
+        if let Some(r) = kb("/proc/self/status", "VmRSS:") {
+            out.push(("rss", format!("{:.0}", r / 1024.0)));
+        }
+        // temp: the CPU package sensor, else the hottest thermal zone.
+        let mut cpu_temp = None;
+        let mut hottest: Option<f64> = None;
+        for dir in std::fs::read_dir("/sys/class/hwmon").into_iter().flatten().flatten() {
+            let name = std::fs::read_to_string(dir.path().join("name")).unwrap_or_default();
+            let Some(t) = std::fs::read_to_string(dir.path().join("temp1_input")).ok().and_then(|v| v.trim().parse::<f64>().ok()) else { continue };
+            match name.trim() {
+                "k10temp" | "coretemp" | "zenpower" | "cpu_thermal" => cpu_temp = Some(t / 1000.0),
+                "acpitz" => hottest = Some(hottest.map_or(t / 1000.0, |h| h.max(t / 1000.0))),
+                _ => {}
+            }
+        }
+        if let Some(t) = cpu_temp.or(hottest) {
+            out.push(("temp", format!("{t:.0}")));
+        }
+        out
+    }
+
+    /// Windows: one PowerShell call. Temperature needs admin rights, so it is often missing.
+    #[cfg(windows)]
+    fn sample(&mut self) -> Vec<(&'static str, String)> {
+        let script = format!(
+            "$o=Get-CimInstance Win32_OperatingSystem;\
+             $c=(Get-CimInstance Win32_Processor|Measure-Object LoadPercentage -Average).Average;\
+             $t=try{{(Get-CimInstance -Namespace root/wmi MSAcpi_ThermalZoneTemperature -EA Stop|Measure-Object CurrentTemperature -Maximum).Maximum/10-273.15}}catch{{''}};\
+             $p=(Get-Process -Id {}).WorkingSet64;\
+             \"$c;$($o.TotalVisibleMemorySize);$($o.FreePhysicalMemory);$t;$p\"",
+            std::process::id()
+        );
+        let Ok(r) = std::process::Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).output() else {
+            return Vec::new();
+        };
+        let text = String::from_utf8_lossy(&r.stdout);
+        let f: Vec<Option<f64>> = text.trim().split(';').map(|x| x.trim().parse().ok()).collect();
+        let get = |i: usize| f.get(i).copied().flatten();
+        let mut out = Vec::new();
+        if let Some(c) = get(0) {
+            out.push(("cpu", format!("{c:.0}")));
+        }
+        if let (Some(t), Some(free)) = (get(1), get(2)) {
+            out.push(("ram", format!("{:.0}", (t - free) / 1024.0)));
+            out.push(("ramtot", format!("{:.0}", t / 1024.0)));
+        }
+        if let Some(t) = get(3) {
+            out.push(("temp", format!("{t:.0}")));
+        }
+        if let Some(p) = get(4) {
+            out.push(("rss", format!("{:.0}", p / 1048576.0)));
+        }
+        out
+    }
+}
+
+/// Reports what this worker is doing and its machine's load every 10 seconds.
+fn heartbeat(c: Client, name: String, threads: usize, state: Arc<Mutex<&'static str>>) {
+    let mut sampler = SysSampler { last_cpu: None };
+    let empty = c.tmp.join("beat.bin");
+    let _ = std::fs::write(&empty, b"");
+    loop {
+        let mut q = format!("/beat?name={name}&threads={threads}&state={}", state.lock().unwrap());
+        for (k, v) in sampler.sample() {
+            q += &format!("&{k}={v}");
+        }
+        let _ = c.call("POST", &q, Some(&empty));
+        std::thread::sleep(Duration::from_secs(10));
+    }
+}
+
 fn machine_name() -> String {
     for var in ["G2048_NAME", "COMPUTERNAME", "HOSTNAME"] {
         if let Ok(v) = std::env::var(var) {
@@ -519,7 +706,22 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
     let c = Client { url: url.trim_end_matches('/').to_string(), auth: format!("Authorization: Bearer {token}"), tmp: cache.clone() };
     let cached = cache.join("net.bin");
     let cached_seq = cache.join("net.seq");
+    // On a Windows desktop, training at full priority on every core freezes the UI:
+    // leave one core free and drop below normal so the machine stays usable.
+    #[cfg(windows)]
+    let threads = {
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &format!("(Get-Process -Id {}).PriorityClass='BelowNormal'", std::process::id())])
+            .status();
+        threads.saturating_sub(1).max(1)
+    };
     eprintln!("worker {me} using {threads} threads");
+    let status = Arc::new(Mutex::new("starting"));
+    {
+        let (c, name, status) = (c.clone(), name.clone(), status.clone());
+        std::thread::spawn(move || heartbeat(c, name, threads, status));
+    }
+    let set = |s: &'static str| *status.lock().unwrap() = s;
 
     // The local net, the master as this worker last knew it (`mirror`), and the master's seq.
     // net - mirror is training not yet sent; each chunk sends the biggest part of it.
@@ -532,9 +734,13 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
     let mut pool: Option<RestartPool> = None;
     let mut last_cache_save = Instant::now();
     let mut seed = nanos;
-    let backoff = || std::thread::sleep(Duration::from_secs(30));
+    let backoff = || {
+        set("retrying");
+        std::thread::sleep(Duration::from_secs(30));
+    };
 
     loop {
+        set("syncing");
         let job = match c.text("GET", "/job", None) {
             Ok(j) => j,
             Err(e) => {
@@ -544,13 +750,17 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
             }
         };
         if job_value(&job, "pause").unwrap_or(0.0) > 0.0 {
+            set("paused");
             std::thread::sleep(Duration::from_secs(60));
             continue;
         }
         // Get in sync with the master: cached or downloaded net, then everyone's newer deltas.
         let (net, mut mirror, seq) = match state.take() {
             Some(s) => s,
-            None => match download_net(&c) {
+            None => match {
+                set("downloading net");
+                download_net(&c)
+            } {
                 Ok((n, seq)) => {
                     let mirror = n.snapshot();
                     (n, mirror, seq)
@@ -596,6 +806,7 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
         let send_mb = job_value(&job, "send_mb").unwrap_or(16.0);
         let counters: Vec<AtomicU64> = (0..8).map(|_| AtomicU64::new(0)).collect();
         let start = Instant::now();
+        set("training");
         seed = seed.wrapping_add(0x9E37_79B9);
         ntuple::train_parallel(&net, pool, alpha, restart, seed, threads, u64::MAX, Some(start + Duration::from_secs_f64(secs)), &|_, e| {
             counters[0].fetch_add(1, Relaxed);
@@ -611,6 +822,7 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
         });
         let v: Vec<u64> = counters.iter().map(|a| a.load(Relaxed)).collect();
         let chunk = Chunk { secs: start.elapsed().as_secs_f64(), episodes: v[0], fresh: v[1], score: v[2], reached: [v[3], v[4], v[5], v[6], v[7]] };
+        set("sending");
         let unsent = net.diff(&mirror);
         let pending = unsent.len();
         let sent = pick_largest(unsent, send_mb * 1e6);
