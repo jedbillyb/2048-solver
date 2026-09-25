@@ -11,7 +11,7 @@ use std::time::Instant;
 const USAGE: &str = "usage:
   g2048 bench [games=16] [seed=1] [--net FILE --depth N]
   g2048 serve --net FILE [--depth N] [--port 20480]
-  g2048 train OUT_FILE [games=1000000] [--resume FILE] [--alpha A] [--seed S] [--tc 1]";
+  g2048 train OUT_FILE [games=1000000] [--resume FILE] [--alpha A] [--seed S] [--tc 1] [--stages 3] [--restart 0.5]";
 
 struct GameResult {
     score: u64,
@@ -111,8 +111,11 @@ fn train(args: &[String]) {
     let seed: u64 = flag(args, "--seed").unwrap_or(42);
     let mut net = match flag::<String>(args, "--resume") {
         Some(p) => NTuple::load(&p).unwrap_or_else(|e| panic!("loading {p}: {e}")),
-        None => NTuple::new(0.0),
+        None => NTuple::new(0.0, 1),
     };
+    net.expand_stages(flag(args, "--stages").unwrap_or(1));
+    let restart_p: f32 = flag(args, "--restart").unwrap_or(0.0);
+    let pool = Arc::new(ntuple::RestartPool::new(net.stages(), 100_000));
     if flag::<u8>(args, "--tc") == Some(1) {
         net.enable_tc();
     }
@@ -121,12 +124,14 @@ fn train(args: &[String]) {
     let nt = threads(games);
     let next = Arc::new(AtomicU64::new(0));
     const WINDOW: u64 = 10_000;
+    static WINDOWS_DONE: AtomicU64 = AtomicU64::new(0);
     // Per-window tallies: [score sum, games, >=2048, >=4096, >=8192, >=16384]
     let stats: Arc<Vec<AtomicU64>> = Arc::new((0..6).map(|_| AtomicU64::new(0)).collect());
     let start = Instant::now();
     let handles: Vec<_> = (0..nt as u64)
         .map(|tid| {
-            let (net, tables, next, stats, out) = (net.clone(), tables.clone(), next.clone(), stats.clone(), out.clone());
+            let (net, tables, next, stats, out, pool) =
+                (net.clone(), tables.clone(), next.clone(), stats.clone(), out.clone(), pool.clone());
             std::thread::spawn(move || {
                 let mut rng = Rng((seed ^ (tid + 1)).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
                 loop {
@@ -134,7 +139,11 @@ fn train(args: &[String]) {
                     if g >= games {
                         break;
                     }
-                    let e = ntuple::train_episode(&net, &tables, &mut rng, alpha);
+                    let e = ntuple::train_episode(&net, &tables, &mut rng, alpha, &pool, restart_p);
+                    // Only fresh games say how strong the net is; restarts begin mid-game.
+                    if !e.fresh {
+                        continue;
+                    }
                     stats[0].fetch_add(e.score, Ordering::Relaxed);
                     for (i, k) in [11u8, 12, 13, 14].iter().enumerate() {
                         if e.max_rank >= *k {
@@ -145,10 +154,10 @@ fn train(args: &[String]) {
                         let v: Vec<u64> = stats.iter().map(|s| s.swap(0, Ordering::Relaxed)).collect();
                         let pct = |x: u64| 100.0 * x as f64 / v[1] as f64;
                         println!(
-                            "{:>9} games {:>6.0}s  mean {:>7.0}  2048 {:>5.1}%  4096 {:>5.1}%  8192 {:>5.1}%  16384 {:>4.1}%",
-                            g + 1, start.elapsed().as_secs_f64(), v[0] as f64 / v[1] as f64, pct(v[2]), pct(v[3]), pct(v[4]), pct(v[5])
+                            "{:>9} games {:>6.0}s  mean {:>7.0}  2048 {:>5.1}%  4096 {:>5.1}%  8192 {:>5.1}%  16384 {:>4.1}%  pool {:?}",
+                            g + 1, start.elapsed().as_secs_f64(), v[0] as f64 / v[1] as f64, pct(v[2]), pct(v[3]), pct(v[4]), pct(v[5]), pool.sizes()
                         );
-                        if (g + 1) % (WINDOW * 10) < WINDOW {
+                        if WINDOWS_DONE.fetch_add(1, Ordering::Relaxed) % 10 == 9 {
                             net.save(&out).expect("saving weights");
                         }
                     }

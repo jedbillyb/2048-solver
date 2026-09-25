@@ -25,3 +25,8 @@ Weights live in `nets/` (gitignored, ~270 MB each).
 |---|---|---|---|---|---|
 | Net after 100k training games, 1-ply greedy | last 10k | 65,493 | 67.5% | 10.9% | 0% |
 | Same net + expectimax depth 2 | 8 | 125,954 | 100% | 62.5% | 0% |
+| Net after 3M games, 1-ply greedy | last 10k | 162,533 | 94.1% | 78.1% | 24.8% |
+| Same net + expectimax depth 2 | 32 | 298,250 | 100% | 100% | 81.2% |
+
+None of these reach 32768 yet. Next: a 3-stage network (separate weights once 16384 / 32768
+appear) trained with restarts from saved endgame boards (`train --stages 3 --restart 0.5`).
