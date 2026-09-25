@@ -231,6 +231,25 @@ impl Coord {
     }
 }
 
+fn recent_rate(w: &WorkerInfo) -> f64 {
+    let mut c = Chunk::default();
+    w.recent.iter().for_each(|x| c.add(x));
+    c.rate()
+}
+
+/// This worker's share of the games all live workers play per second.
+fn share(workers: &HashMap<String, WorkerInfo>, name: &str) -> f32 {
+    let live = |w: &&WorkerInfo| w.last_seen.elapsed() < Duration::from_secs(600);
+    let total: f64 = workers.values().filter(live).map(recent_rate).sum();
+    let mine = workers.get(name).map_or(0.0, recent_rate);
+    if total > 0.0 { (mine / total).clamp(0.05, 1.0) as f32 } else { 1.0 }
+}
+
+/// A delta times `scale`, rounded to what the wire carries so both ends agree exactly.
+fn scaled(delta: &[(u32, f32)], scale: f32) -> Vec<(u32, f32)> {
+    delta.iter().map(|&(i, d)| (i, from_bf16(to_bf16(d * scale)))).filter(|e| e.1 != 0.0).collect()
+}
+
 fn parse_query(target: &str) -> (String, HashMap<String, String>) {
     let (path, q) = target.split_once('?').unwrap_or((target, ""));
     let map = q.split('&').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect();
@@ -337,20 +356,26 @@ fn handle(mut stream: TcpStream, coord: &Mutex<Coord>, token: &str) -> std::io::
             let name = q.get("name").cloned().unwrap_or_else(|| me.clone());
             let chunk = Chunk::from_query(&q);
             let mut c = coord.lock().unwrap();
-            c.net.apply(&delta);
-            c.seq += 1;
-            let seq = c.seq;
-            c.log_bytes += body.len();
-            c.log.push_back(Delta { seq, from: me, bytes: Arc::new(body), at: Instant::now() });
-            let w = c.workers.entry(name).or_insert(WorkerInfo { last_seen: Instant::now(), recent: VecDeque::new(), total_episodes: 0 });
+            let w = c.workers.entry(name.clone()).or_insert(WorkerInfo { last_seen: Instant::now(), recent: VecDeque::new(), total_episodes: 0 });
             w.last_seen = Instant::now();
             w.total_episodes += chunk.episodes;
             w.recent.push_back(chunk);
             if w.recent.len() > RECENT {
                 w.recent.pop_front();
             }
+            // Workers all learn the common positions at once, so summing their changes would
+            // move those weights several times over. Each change is weighted by the worker's
+            // share of games instead, which averages the machines' nets.
+            let scale = share(&c.workers, &name);
+            let delta = scaled(&delta, scale);
+            c.net.apply(&delta);
+            c.seq += 1;
+            let seq = c.seq;
+            let bytes = encode(&delta);
+            c.log_bytes += bytes.len();
+            c.log.push_back(Delta { seq, from: me, bytes: Arc::new(bytes), at: Instant::now() });
             drop(c);
-            respond(&mut stream, 200, seq.to_string().as_bytes());
+            respond(&mut stream, 200, format!("{seq} {scale}").as_bytes());
         }
         _ => respond(&mut stream, 404, b"no such endpoint\n"),
     }
@@ -593,18 +618,28 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
         let file = cache.join("delta.bin");
         std::fs::write(&file, &bytes).expect("writing delta");
         // Keep retrying: dropping a delta would leave this copy ahead of the master for good.
-        loop {
+        let reply = loop {
             match c.text("POST", &format!("/delta?me={me}&name={name}&{}", chunk.to_query()), Some(&file)) {
-                Ok(_) => break,
+                Ok(r) => break r,
                 Err(e) => {
                     eprintln!("{e}; retrying in 30s");
                     backoff();
                 }
             }
+        };
+        // The master took `scale` of what was sent; keep the same here so this copy matches it.
+        let scale: f32 = reply.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(1.0);
+        let taken = scaled(&sent, scale);
+        let mut back = Vec::with_capacity(sent.len());
+        let mut t = taken.iter().peekable();
+        for &(i, d) in &sent {
+            let a = if t.peek().is_some_and(|x| x.0 == i) { t.next().unwrap().1 } else { 0.0 };
+            back.push((i, a - d));
         }
-        add_into(&mut mirror, &sent);
+        net.apply(&back);
+        add_into(&mut mirror, &taken);
         eprintln!(
-            "{} games in {:.0}s, mean score {:.0}; sent {:.1} MB ({} of {} changed weights)",
+            "{} games in {:.0}s, mean score {:.0}; sent {:.1} MB ({} of {} changed weights), share {scale:.2}",
             chunk.episodes,
             chunk.secs,
             if chunk.fresh > 0 { chunk.score as f64 / chunk.fresh as f64 } else { 0.0 },
