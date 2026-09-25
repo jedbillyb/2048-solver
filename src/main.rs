@@ -357,8 +357,11 @@ fn main() {
         }
         Some("worker") => {
             let a = &args[1..];
-            let url = flag(a, "--url").unwrap_or_else(|| panic!("{USAGE}"));
+            let url: String = flag(a, "--url").unwrap_or_else(|| panic!("{USAGE}"));
             let cache = flag::<String>(a, "--cache").unwrap_or_else(|| "g2048-cache".into());
+            if std::env::var_os(dist::CHILD_ENV).is_none() {
+                return dist::supervise(&url);
+            }
             dist::worker(url, token(a), flag(a, "--name"), flag(a, "--threads").unwrap_or_else(|| threads(u64::MAX)), cache.into())
         }
         _ => eprintln!("{USAGE}"),

@@ -717,6 +717,53 @@ fn machine_name() -> String {
     std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()).unwrap_or_else(|_| "worker".into())
 }
 
+/// Workers older than the job's `version=` restart into the new build on their own.
+const BUILD: u32 = 2;
+pub const CHILD_ENV: &str = "G2048_WORKER_CHILD";
+/// The exit code a worker uses to ask its supervisor for the new build.
+const UPDATE_EXIT: i32 = 42;
+
+/// Runs the worker as a child process and restarts it when it exits: after a crash, or
+/// with the new build when the job asks for one. On Windows it first swaps in the exe the
+/// server publishes (a running exe can be renamed, not overwritten); elsewhere the binary
+/// on disk is already the new one.
+pub fn supervise(url: &str) {
+    let exe = std::env::current_exe().expect("finding own exe");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    loop {
+        let started = Instant::now();
+        let code = std::process::Command::new(&exe).args(&args).env(CHILD_ENV, "1").status().ok().and_then(|s| s.code());
+        match code {
+            Some(UPDATE_EXIT) => {
+                // Asked again right after an update: the new build isn't published yet.
+                if started.elapsed() < Duration::from_secs(300) {
+                    std::thread::sleep(Duration::from_secs(300));
+                }
+                if cfg!(windows) {
+                    eprintln!("downloading the new version...");
+                    let new = exe.with_extension("new.exe");
+                    let got = std::process::Command::new("curl")
+                        .args(["-sSf", "--connect-timeout", "20", "-o"])
+                        .arg(&new)
+                        .arg(format!("{}/files/g2048.exe", url.trim_end_matches('/')))
+                        .status()
+                        .is_ok_and(|s| s.success());
+                    let old = exe.with_extension("old.exe");
+                    let _ = std::fs::remove_file(&old);
+                    if !got || std::fs::rename(&exe, &old).is_err() || std::fs::rename(&new, &exe).is_err() {
+                        eprintln!("update failed, restarting the current version in 60s");
+                        std::thread::sleep(Duration::from_secs(60));
+                    }
+                }
+            }
+            _ => {
+                eprintln!("worker stopped ({code:?}), restarting in 10s");
+                std::thread::sleep(Duration::from_secs(10));
+            }
+        }
+    }
+}
+
 /// `g2048 worker --url URL --token T [--name N] [--threads N] [--cache DIR]`: trains forever.
 pub fn worker(url: String, token: String, name: Option<String>, threads: usize, cache: std::path::PathBuf) {
     std::fs::create_dir_all(&cache).expect("creating cache dir");
@@ -743,13 +790,19 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
     let set = |s: &'static str| *status.lock().unwrap() = s;
 
     // The local net, the master as this worker last knew it (`mirror`), and the master's seq.
-    // net - mirror is training not yet sent; each chunk sends the biggest part of it.
-    let mut state: Option<(NTuple, Vec<f32>, u64)> = NTuple::load(cached.to_str().unwrap()).ok().and_then(|n| {
-        let seq = std::fs::read_to_string(&cached_seq).ok()?.trim().parse().ok()?;
-        eprintln!("resuming from the cached net at seq {seq}");
-        let mirror = n.snapshot();
-        Some((n, mirror, seq))
-    });
+    // net - mirror is training not yet sent. While one chunk trains, a background thread
+    // sends the previous chunk's changes and pulls everyone else's, so no core sits idle.
+    let mut net: Option<Arc<NTuple>> = None;
+    let mut mirror: Vec<f32> = Vec::new();
+    let mut seq = 0;
+    if let Some(n) = NTuple::load(cached.to_str().unwrap()).ok() {
+        if let Some(s) = std::fs::read_to_string(&cached_seq).ok().and_then(|s| s.trim().parse().ok()) {
+            eprintln!("resuming from the cached net at seq {s}");
+            mirror = n.snapshot();
+            (net, seq) = (Some(Arc::new(n)), s);
+        }
+    }
+    let mut syncing: Option<std::thread::JoinHandle<(Vec<f32>, Option<u64>)>> = None;
     let mut pool: Option<RestartPool> = None;
     let mut last_cache_save = Instant::now();
     let mut seed = nanos;
@@ -759,7 +812,6 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
     };
 
     loop {
-        set("syncing");
         let job = match c.text("GET", "/job", None) {
             Ok(j) => j,
             Err(e) => {
@@ -768,55 +820,54 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
                 continue;
             }
         };
+        if job_value(&job, "version").unwrap_or(0.0) > BUILD as f64 {
+            set("updating");
+            eprintln!("a new version is out; finishing the last sync and restarting");
+            if let Some(h) = syncing.take() {
+                let (_, s) = h.join().expect("sync thread panicked");
+                // Keep the net so the new build resumes without the big download.
+                if let (Some(n), Some(s)) = (&net, s) {
+                    if n.save(cached.to_str().unwrap()).is_ok() {
+                        let _ = std::fs::write(&cached_seq, s.to_string());
+                    }
+                }
+            }
+            std::process::exit(UPDATE_EXIT);
+        }
         if job_value(&job, "pause").unwrap_or(0.0) > 0.0 {
             set("paused");
             std::thread::sleep(Duration::from_secs(60));
             continue;
         }
-        // Get in sync with the master: cached or downloaded net, then everyone's newer deltas.
-        let (net, mut mirror, seq) = match state.take() {
-            Some(s) => s,
-            None => match {
-                set("downloading net");
-                download_net(&c)
-            } {
-                Ok((n, seq)) => {
-                    let mirror = n.snapshot();
-                    (n, mirror, seq)
+        // No net yet (or too far behind): download the master and catch up before training.
+        if net.is_none() {
+            set("downloading net");
+            let n = match download_net(&c) {
+                Ok((n, s)) => {
+                    seq = s;
+                    n
                 }
                 Err(e) => {
                     eprintln!("{e}; retrying in 30s");
                     backoff();
                     continue;
                 }
-            },
-        };
-        let seq = match pull(&c, &net, &mut mirror, seq, &me) {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                eprintln!("too far behind the master, downloading it again");
-                continue;
+            };
+            mirror = n.snapshot();
+            set("syncing");
+            match pull(&c, &n, &mut mirror, seq, &me) {
+                Ok(Some(s)) => seq = s,
+                Ok(None) => continue,
+                Err(e) => {
+                    eprintln!("{e}; retrying in 30s");
+                    backoff();
+                    continue;
+                }
             }
-            Err(e) => {
-                eprintln!("{e}; retrying in 30s");
-                state = Some((net, mirror, seq));
-                backoff();
-                continue;
-            }
-        };
-        if last_cache_save.elapsed() > Duration::from_secs(1800) {
-            if net.save(cached.to_str().unwrap()).is_ok() {
-                let _ = std::fs::write(&cached_seq, seq.to_string());
-            }
-            last_cache_save = Instant::now();
+            net = Some(Arc::new(n));
         }
-        let pool = pool.get_or_insert_with(|| RestartPool::new(net.stages(), 100_000));
-        // TC fine-tuning phase: its per-weight accumulators stay local to each worker.
-        let mut net = net;
-        if job_value(&job, "tc").unwrap_or(0.0) > 0.0 && !net.tc_enabled() {
-            eprintln!("switching to TC learning");
-            net.enable_tc();
-        }
+        let n = net.clone().unwrap();
+        let pool = pool.get_or_insert_with(|| RestartPool::new(n.stages(), 100_000));
 
         // Train one chunk.
         let alpha = job_value(&job, "alpha").unwrap_or(0.00015625) as f32;
@@ -827,7 +878,7 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
         let start = Instant::now();
         set("training");
         seed = seed.wrapping_add(0x9E37_79B9);
-        ntuple::train_parallel(&net, pool, alpha, restart, seed, threads, u64::MAX, Some(start + Duration::from_secs_f64(secs)), &|_, e| {
+        ntuple::train_parallel(&n, pool, alpha, restart, seed, threads, u64::MAX, Some(start + Duration::from_secs_f64(secs)), &|_, e| {
             counters[0].fetch_add(1, Relaxed);
             if e.fresh {
                 counters[1].fetch_add(1, Relaxed);
@@ -841,44 +892,85 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
         });
         let v: Vec<u64> = counters.iter().map(|a| a.load(Relaxed)).collect();
         let chunk = Chunk { secs: start.elapsed().as_secs_f64(), episodes: v[0], fresh: v[1], score: v[2], reached: [v[3], v[4], v[5], v[6], v[7]] };
-        set("sending");
-        let unsent = net.diff(&mirror);
+        drop(n);
+
+        // The previous chunk's sync must land before this chunk's changes are measured.
+        if let Some(h) = syncing.take() {
+            set("syncing");
+            let (m, s) = h.join().expect("sync thread panicked");
+            mirror = m;
+            match s {
+                Some(s) => seq = s,
+                None => {
+                    eprintln!("too far behind the master, downloading it again");
+                    net = None;
+                    continue;
+                }
+            }
+        }
+        let n = net.as_mut().unwrap();
+        // TC fine-tuning phase: its per-weight accumulators stay local to each worker.
+        if job_value(&job, "tc").unwrap_or(0.0) > 0.0 && !n.tc_enabled() {
+            eprintln!("switching to TC learning");
+            Arc::get_mut(n).expect("net still shared").enable_tc();
+        }
+        if last_cache_save.elapsed() > Duration::from_secs(1800) {
+            if n.save(cached.to_str().unwrap()).is_ok() {
+                let _ = std::fs::write(&cached_seq, seq.to_string());
+            }
+            last_cache_save = Instant::now();
+        }
+        set("preparing update");
+        let unsent = n.diff(&mirror);
         let pending = unsent.len();
         let sent = pick_largest(unsent, send_mb * 1e6);
         let bytes = encode(&sent);
         let file = cache.join("delta.bin");
         std::fs::write(&file, &bytes).expect("writing delta");
-        // Keep retrying: dropping a delta would leave this copy ahead of the master for good.
-        let reply = loop {
-            match c.text("POST", &format!("/delta?me={me}&name={name}&{}", chunk.to_query()), Some(&file)) {
-                Ok(r) => break r,
-                Err(e) => {
-                    eprintln!("{e}; retrying in 30s");
-                    backoff();
+
+        let (c, n, me, name, mut mirror_owned) = (c.clone(), n.clone(), me.clone(), name.clone(), std::mem::take(&mut mirror));
+        syncing = Some(std::thread::spawn(move || {
+            // Keep retrying: dropping a delta would leave this copy ahead of the master for good.
+            let reply = loop {
+                match c.text("POST", &format!("/delta?me={me}&name={name}&{}", chunk.to_query()), Some(&file)) {
+                    Ok(r) => break r,
+                    Err(e) => {
+                        eprintln!("{e}; retrying in 30s");
+                        std::thread::sleep(Duration::from_secs(30));
+                    }
                 }
+            };
+            // The master took `scale` of what was sent; keep the same here so this copy matches it.
+            let scale: f32 = reply.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(1.0);
+            let taken = scaled(&sent, scale);
+            let mut back = Vec::with_capacity(sent.len());
+            let mut t = taken.iter().peekable();
+            for &(i, d) in &sent {
+                let a = if t.peek().is_some_and(|x| x.0 == i) { t.next().unwrap().1 } else { 0.0 };
+                back.push((i, a - d));
             }
-        };
-        // The master took `scale` of what was sent; keep the same here so this copy matches it.
-        let scale: f32 = reply.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(1.0);
-        let taken = scaled(&sent, scale);
-        let mut back = Vec::with_capacity(sent.len());
-        let mut t = taken.iter().peekable();
-        for &(i, d) in &sent {
-            let a = if t.peek().is_some_and(|x| x.0 == i) { t.next().unwrap().1 } else { 0.0 };
-            back.push((i, a - d));
-        }
-        net.apply(&back);
-        add_into(&mut mirror, &taken);
-        eprintln!(
-            "{} games in {:.0}s, mean score {:.0}; sent {:.1} MB ({} of {} changed weights), share {scale:.2}",
-            chunk.episodes,
-            chunk.secs,
-            if chunk.fresh > 0 { chunk.score as f64 / chunk.fresh as f64 } else { 0.0 },
-            bytes.len() as f64 / 1e6,
-            sent.len(),
-            pending
-        );
-        state = Some((net, mirror, seq));
+            n.apply(&back);
+            add_into(&mut mirror_owned, &taken);
+            eprintln!(
+                "{} games in {:.0}s, mean score {:.0}; sent {:.1} MB ({} of {} changed weights), share {scale:.2}",
+                chunk.episodes,
+                chunk.secs,
+                if chunk.fresh > 0 { chunk.score as f64 / chunk.fresh as f64 } else { 0.0 },
+                bytes.len() as f64 / 1e6,
+                sent.len(),
+                pending
+            );
+            let s = loop {
+                match pull(&c, &n, &mut mirror_owned, seq, &me) {
+                    Ok(s) => break s,
+                    Err(e) => {
+                        eprintln!("{e}; retrying in 30s");
+                        std::thread::sleep(Duration::from_secs(30));
+                    }
+                }
+            };
+            (mirror_owned, s)
+        }));
     }
 }
 
