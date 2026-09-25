@@ -38,10 +38,11 @@ pub fn slide_row(row: u16) -> (u16, u32) {
     let mut out = [0u8; 4];
     let (mut i, mut o, mut score) = (0, 0, 0u32);
     while i < n {
-        // Rank 15 (32768) can't merge: 65536 doesn't fit a nibble.
-        if i + 1 < n && line[i] == line[i + 1] && line[i] < 15 {
-            out[o] = line[i] + 1;
-            score += 1 << out[o];
+        if i + 1 < n && line[i] == line[i + 1] {
+            // 65536 doesn't fit a nibble, so two 32768s merge into a 32768 worth 65536
+            // points. Callers spot it as the count of 32768s dropping (see count_rank).
+            out[o] = (line[i] + 1).min(15);
+            score += 1 << (line[i] + 1);
             i += 2;
         } else {
             out[o] = line[i];
@@ -118,6 +119,15 @@ pub fn count_empty(b: Board) -> u32 {
 
 pub fn max_rank(b: Board) -> u8 {
     (0..16).map(|i| ((b >> (4 * i)) & 0xF) as u8).max().unwrap()
+}
+
+pub fn count_rank(b: Board, rank: u64) -> u32 {
+    (0..16).filter(|i| (b >> (4 * i)) & 0xF == rank).count() as u32
+}
+
+/// True if the move from `before` to `after` merged two 32768s, i.e. made 65536.
+pub fn made_65536(before: Board, after: Board) -> bool {
+    count_rank(after, 15) < count_rank(before, 15)
 }
 
 pub fn distinct_tiles(b: Board) -> u32 {
@@ -197,6 +207,10 @@ mod tests {
         assert_eq!(slide_row(0x1102), (0x0022, 4));
         // [2,2,4,.] -> [4,4]
         assert_eq!(slide_row(0x0211), (0x0022, 4));
+        // [32768,32768,.,.] -> one tile worth 65536 points
+        let (r, sc) = slide_row(0x00FF);
+        assert_eq!((r, sc), (0x000F, 65536));
+        assert!(made_65536(0x00FF, r as u64));
     }
 
     #[test]

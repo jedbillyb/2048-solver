@@ -17,6 +17,8 @@ struct GameResult {
     score: u64,
     max_rank: u8,
     moves: u64,
+    /// Two 32768s merged. The game stops there: that's the goal.
+    won_65536: bool,
 }
 
 fn flag<T: std::str::FromStr>(args: &[String], name: &str) -> Option<T> {
@@ -44,17 +46,22 @@ fn threads(cap: u64) -> usize {
 fn play(ai: &ai::Ai, seed: u64) -> GameResult {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let mut b = spawn(spawn(0, &mut rng), &mut rng);
-    let (mut score, mut moves) = (0u64, 0u64);
+    let (mut score, mut moves, mut won_65536) = (0u64, 0u64, false);
     while let Some(d) = ai.best_move(b) {
         let (nb, s) = ai.tables().apply(b, d);
         score += s as u64;
         moves += 1;
+        if made_65536(b, nb) {
+            won_65536 = true;
+            b = nb;
+            break;
+        }
         b = spawn(nb, &mut rng);
     }
     if std::env::var_os("G2048_SHOW_END").is_some() {
         eprintln!("final board (score {score}):\n{}", board::print(b));
     }
-    GameResult { score, max_rank: max_rank(b), moves }
+    GameResult { score, max_rank: max_rank(b), moves, won_65536 }
 }
 
 fn report(results: &[GameResult], secs: f64, threads: usize) {
@@ -68,6 +75,8 @@ fn report(results: &[GameResult], secs: f64, threads: usize) {
         let hit = results.iter().filter(|r| r.max_rank >= k).count();
         println!("reached {:>5}: {:>5.1}%", 1u32 << k, 100.0 * hit as f64 / n);
     }
+    let won = results.iter().filter(|r| r.won_65536).count();
+    println!("reached 65536: {:>5.1}%", 100.0 * won as f64 / n);
 }
 
 fn bench(args: &[String]) {
@@ -95,7 +104,8 @@ fn bench(args: &[String]) {
                         break out;
                     }
                     let r = play(&ai, seed0 + g);
-                    eprintln!("game {:>3}: score {:>7}  max tile {:>5}  moves {}", g, r.score, 1u32 << r.max_rank, r.moves);
+                    let tile = if r.won_65536 { 65536 } else { 1u32 << r.max_rank };
+                    eprintln!("game {:>3}: score {:>7}  max tile {:>5}  moves {}", g, r.score, tile, r.moves);
                     out.push(r);
                 }
             })
