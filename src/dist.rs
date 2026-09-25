@@ -91,6 +91,11 @@ fn pick_largest(mut raw: Vec<(u32, f32)>, budget_bytes: f64) -> Vec<(u32, f32)> 
 }
 
 /// Job settings as `key=value` lines.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn job_text<'a>(job: &'a str, key: &str) -> Option<&'a str> {
+    job.lines().find_map(|l| Some(l.strip_prefix(key)?.strip_prefix('=')?.trim()))
+}
+
 fn job_value(job: &str, key: &str) -> Option<f64> {
     job.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('=')?.trim().parse().ok())
 }
@@ -718,7 +723,7 @@ fn machine_name() -> String {
 }
 
 /// Workers older than the job's `version=` restart into the new build on their own.
-const BUILD: u32 = 2;
+const BUILD: u32 = 3;
 pub const CHILD_ENV: &str = "G2048_WORKER_CHILD";
 /// The exit code a worker uses to ask its supervisor for the new build.
 const UPDATE_EXIT: i32 = 42;
@@ -780,12 +785,6 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
     let c = Client { url: url.trim_end_matches('/').to_string(), auth: format!("Authorization: Bearer {token}"), tmp: cache.clone(), max_time: None };
     let cached = cache.join("net.bin");
     let cached_seq = cache.join("net.seq");
-    // Below normal priority still uses every core when the machine is idle, but lets the
-    // Windows desktop take the CPU when it needs it instead of freezing.
-    #[cfg(windows)]
-    let _ = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &format!("(Get-Process -Id {}).PriorityClass='BelowNormal'", std::process::id())])
-        .status();
     eprintln!("worker {me} using {threads} threads");
     let status = Arc::new(Mutex::new("starting"));
     let cores = Arc::new(Mutex::new(threads));
@@ -814,6 +813,8 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
     let mut pool: Option<RestartPool> = None;
     let mut last_cache_save = Instant::now();
     let mut seed = nanos;
+    #[cfg(windows)]
+    let mut priority = String::new();
     let backoff = || {
         set("retrying");
         std::thread::sleep(Duration::from_secs(30));
@@ -890,6 +891,18 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
         let restart = job_value(&job, "restart").unwrap_or(0.5) as f32;
         let secs = job_value(&job, "secs").unwrap_or(120.0);
         let send_mb = job_value(&job, "send_mb").unwrap_or(16.0);
+        // `priority.NAME=high` etc. sets a Windows machine's priority class. Below normal (the
+        // default) still uses every core when idle but lets the desktop go first.
+        #[cfg(windows)]
+        {
+            let want = job_text(&job, &format!("priority.{name}")).unwrap_or("BelowNormal").to_string();
+            if want != priority {
+                let _ = std::process::Command::new("powershell")
+                    .args(["-NoProfile", "-NonInteractive", "-Command", &format!("(Get-Process -Id {}).PriorityClass='{want}'", std::process::id())])
+                    .status();
+                priority = want;
+            }
+        }
         // `threads.NAME=N` in the job caps one machine's cores.
         let threads = job_value(&job, &format!("threads.{name}")).map_or(threads, |t| (t as usize).clamp(1, threads));
         *cores.lock().unwrap() = threads;
