@@ -1,5 +1,5 @@
 //! N-tuple network value function over afterstates (Szubert & Jaskowski style),
-//! 4 six-tuples x 8 board symmetries, trained by TD(0). Weights are shared across
+//! 4 or 8 six-tuples x 8 board symmetries, trained by TD(0). Weights are shared across
 //! training threads Hogwild-style through relaxed atomics.
 //!
 //! The network can be split into stages by the largest tile on the board
@@ -11,22 +11,36 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::Mutex;
 
-const BASE_TUPLES: [[usize; 6]; 4] = [
+/// Cells are row-major, 0 = top-left. The first four are the classic 4x6 set;
+/// the 8-tuple network adds four more shapes covering corners and diagonals.
+pub const TUPLES_4: [[usize; 6]; 4] = [
     [0, 1, 2, 3, 4, 5],
     [4, 5, 6, 7, 8, 9],
     [0, 1, 2, 4, 5, 6],
     [4, 5, 6, 8, 9, 10],
 ];
+pub const TUPLES_8: [[usize; 6]; 8] = [
+    [0, 1, 2, 3, 4, 5],
+    [4, 5, 6, 7, 8, 9],
+    [0, 1, 2, 4, 5, 6],
+    [4, 5, 6, 8, 9, 10],
+    [0, 1, 5, 6, 7, 10],
+    [0, 1, 2, 5, 9, 10],
+    [0, 1, 5, 9, 13, 14],
+    [0, 1, 5, 8, 9, 13],
+];
+const MAX_TUPLES: usize = 8;
 const TUPLE_SIZE: usize = 1 << 24;
-const STAGE_SIZE: usize = BASE_TUPLES.len() * TUPLE_SIZE;
 /// Rank of the tile that opens stage 1 (16384); each rank above opens the next stage.
 const FIRST_STAGE_RANK: u8 = 14;
 const MAGIC_V1: &[u8; 8] = b"2048NT01";
 const MAGIC_V2: &[u8; 8] = b"2048NT02";
+const MAGIC_V3: &[u8; 8] = b"2048NT03";
 
 pub struct NTuple {
     w: Vec<AtomicU32>,
     stages: usize,
+    tuples: Vec<[usize; 6]>,
     /// Temporal coherence accumulators (sum of errors, sum of |errors|) per weight;
     /// empty unless TC learning is enabled.
     tc: Vec<(AtomicU32, AtomicU32)>,
@@ -41,14 +55,25 @@ fn symmetries(c: usize) -> [usize; 8] {
 }
 
 impl NTuple {
-    pub fn new(init: f32, stages: usize) -> Self {
-        let cells = BASE_TUPLES
+    pub fn new(init: f32, stages: usize, tuples: &[[usize; 6]]) -> Self {
+        assert!(!tuples.is_empty() && tuples.len() <= MAX_TUPLES);
+        let cells = tuples
             .iter()
             .map(|t| std::array::from_fn(|s| t.map(|c| symmetries(c)[s])))
             .collect();
         let bits = init.to_bits();
         let stages = stages.max(1);
-        NTuple { w: (0..stages * STAGE_SIZE).map(|_| AtomicU32::new(bits)).collect(), stages, tc: vec![], cells }
+        let n = stages * tuples.len() * TUPLE_SIZE;
+        NTuple { w: (0..n).map(|_| AtomicU32::new(bits)).collect(), stages, tuples: tuples.to_vec(), tc: vec![], cells }
+    }
+
+    #[inline]
+    fn stage_size(&self) -> usize {
+        self.tuples.len() * TUPLE_SIZE
+    }
+
+    pub fn tuple_count(&self) -> usize {
+        self.tuples.len()
     }
 
     pub fn stages(&self) -> usize {
@@ -65,9 +90,10 @@ impl NTuple {
         if n <= self.stages {
             return;
         }
-        let last = (self.stages - 1) * STAGE_SIZE;
+        let size = self.stage_size();
+        let last = (self.stages - 1) * size;
         for _ in self.stages..n {
-            for i in 0..STAGE_SIZE {
+            for i in 0..size {
                 self.w.push(AtomicU32::new(self.w[last + i].load(Relaxed)));
             }
         }
@@ -81,8 +107,8 @@ impl NTuple {
     }
 
     #[inline]
-    fn indices(&self, b: Board, out: &mut [usize; 32]) {
-        let base = self.stage(b) * STAGE_SIZE;
+    fn indices(&self, b: Board, out: &mut [usize; 8 * MAX_TUPLES]) -> usize {
+        let base = self.stage(b) * self.stage_size();
         let mut n = 0;
         for (t, syms) in self.cells.iter().enumerate() {
             for s in syms {
@@ -94,21 +120,22 @@ impl NTuple {
                 n += 1;
             }
         }
+        n
     }
 
     #[inline]
     pub fn value(&self, b: Board) -> f32 {
-        let mut ix = [0; 32];
-        self.indices(b, &mut ix);
-        ix.iter().map(|&i| f32::from_bits(self.w[i].load(Relaxed))).sum()
+        let mut ix = [0; 8 * MAX_TUPLES];
+        let n = self.indices(b, &mut ix);
+        ix[..n].iter().map(|&i| f32::from_bits(self.w[i].load(Relaxed))).sum()
     }
 
     /// Moves every weight the board touches by `alpha * err` (scaled per weight under TC).
     pub fn update(&self, b: Board, alpha: f32, err: f32) {
-        let mut ix = [0; 32];
-        self.indices(b, &mut ix);
+        let mut ix = [0; 8 * MAX_TUPLES];
+        let n = self.indices(b, &mut ix);
         let load = |a: &AtomicU32| f32::from_bits(a.load(Relaxed));
-        for &i in &ix {
+        for &i in &ix[..n] {
             let mut step = alpha * err;
             if let Some((e, a)) = self.tc.get(i) {
                 let (ev, av) = (load(e), load(a));
@@ -126,8 +153,12 @@ impl NTuple {
     pub fn save(&self, path: &str) -> std::io::Result<()> {
         let tmp = format!("{path}.tmp");
         let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-        f.write_all(MAGIC_V2)?;
+        f.write_all(MAGIC_V3)?;
         f.write_all(&(self.stages as u32).to_le_bytes())?;
+        f.write_all(&(self.tuples.len() as u32).to_le_bytes())?;
+        for t in &self.tuples {
+            f.write_all(&t.map(|c| c as u8))?;
+        }
         for w in &self.w {
             f.write_all(&w.load(Relaxed).to_le_bytes())?;
         }
@@ -141,15 +172,28 @@ impl NTuple {
         let mut magic = [0u8; 8];
         f.read_exact(&mut magic)?;
         let mut buf = [0u8; 4];
-        let stages = match &magic {
-            m if m == MAGIC_V1 => 1,
-            m if m == MAGIC_V2 => {
-                f.read_exact(&mut buf)?;
-                u32::from_le_bytes(buf) as usize
+        let mut read_u32 = |f: &mut std::io::BufReader<std::fs::File>| -> std::io::Result<usize> {
+            f.read_exact(&mut buf)?;
+            Ok(u32::from_le_bytes(buf) as usize)
+        };
+        let (stages, tuples) = match &magic {
+            m if m == MAGIC_V1 => (1, TUPLES_4.to_vec()),
+            m if m == MAGIC_V2 => (read_u32(&mut f)?, TUPLES_4.to_vec()),
+            m if m == MAGIC_V3 => {
+                let stages = read_u32(&mut f)?;
+                let n = read_u32(&mut f)?;
+                let mut tuples = vec![];
+                for _ in 0..n {
+                    let mut t = [0u8; 6];
+                    f.read_exact(&mut t)?;
+                    tuples.push(t.map(|c| c as usize));
+                }
+                (stages, tuples)
             }
             _ => return Err(std::io::Error::other("not an n-tuple weights file")),
         };
-        let net = NTuple::new(0.0, stages);
+        let net = NTuple::new(0.0, stages, &tuples);
+        let mut buf = [0u8; 4];
         for w in &net.w {
             f.read_exact(&mut buf)?;
             w.store(u32::from_le_bytes(buf), Relaxed);
@@ -253,7 +297,7 @@ mod tests {
 
     #[test]
     fn symmetric_boards_share_value() {
-        let net = NTuple::new(0.0, 1);
+        let net = NTuple::new(0.0, 1, &TUPLES_4);
         let t = Tables::new();
         let mut rng = Rng(7);
         let pool = RestartPool::new(1, 10);
@@ -267,12 +311,12 @@ mod tests {
 
     #[test]
     fn stages_split_on_big_tiles() {
-        let mut net = NTuple::new(0.0, 1);
+        let mut net = NTuple::new(0.0, 1, &TUPLES_4);
         net.expand_stages(3);
         assert_eq!(net.stage(0x0000_0000_0000_00D1), 0); // 8192
         assert_eq!(net.stage(0x0000_0000_0000_00E1), 1); // 16384
         assert_eq!(net.stage(0x0000_0000_0000_00F1), 2); // 32768
-        let one = NTuple::new(0.0, 1);
+        let one = NTuple::new(0.0, 1, &TUPLES_4);
         assert_eq!(one.stage(0x0000_0000_0000_00F1), 0);
     }
 }

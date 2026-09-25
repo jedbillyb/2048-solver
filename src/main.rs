@@ -11,7 +11,7 @@ use std::time::Instant;
 const USAGE: &str = "usage:
   g2048 bench [games=16] [seed=1] [--net FILE --depth N]
   g2048 serve --net FILE [--depth N] [--port 20480]
-  g2048 train OUT_FILE [games=1000000] [--resume FILE] [--alpha A] [--seed S] [--tc 1] [--stages 3] [--restart 0.5]";
+  g2048 train OUT_FILE [games=1000000] [--resume FILE] [--alpha A] [--seed S] [--tc 1] [--stages 3] [--restart 0.5] [--tuples 4|8]";
 
 struct GameResult {
     score: u64,
@@ -106,12 +106,11 @@ fn train(args: &[String]) {
     let pos = positional(args);
     let out = pos.first().unwrap_or_else(|| panic!("{USAGE}")).to_string();
     let games: u64 = pos.get(1).and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
-    // Per-weight step: 0.1 spread over the 32 weights each board touches.
-    let alpha: f32 = flag(args, "--alpha").unwrap_or(0.1 / 32.0);
+    let alpha_flag: Option<f32> = flag(args, "--alpha");
     let seed: u64 = flag(args, "--seed").unwrap_or(42);
     let mut net = match flag::<String>(args, "--resume") {
         Some(p) => NTuple::load(&p).unwrap_or_else(|e| panic!("loading {p}: {e}")),
-        None => NTuple::new(0.0, 1),
+        None => NTuple::new(0.0, 1, if flag::<u8>(args, "--tuples") == Some(8) { &ntuple::TUPLES_8 } else { &ntuple::TUPLES_4 }),
     };
     net.expand_stages(flag(args, "--stages").unwrap_or(1));
     let restart_p: f32 = flag(args, "--restart").unwrap_or(0.0);
@@ -119,6 +118,8 @@ fn train(args: &[String]) {
     if flag::<u8>(args, "--tc") == Some(1) {
         net.enable_tc();
     }
+    // Per-weight step: 0.1 spread over the weights each board touches (8 per tuple).
+    let alpha = alpha_flag.unwrap_or(0.1 / (8 * net.tuple_count()) as f32);
     let net = Arc::new(net);
     let tables = Arc::new(Tables::new());
     let nt = threads(games);
