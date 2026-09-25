@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const DEFAULT_JOB: &str = "alpha=0.00015625\nrestart=0.5\nsecs=120\nsend_mb=16\npause=0\n";
+const DEFAULT_JOB: &str = "alpha=0.0015625\nrestart=0\nsecs=120\nsend_mb=40\ntc=0\npause=0\n";
 /// Deltas the coordinator keeps for workers that fall behind; older ones need a full download.
 const LOG_BUDGET: usize = 1 << 30;
 const LOG_MAX_AGE: Duration = Duration::from_secs(6 * 3600);
@@ -557,6 +557,12 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
             last_cache_save = Instant::now();
         }
         let pool = pool.get_or_insert_with(|| RestartPool::new(net.stages(), 100_000));
+        // TC fine-tuning phase: its per-weight accumulators stay local to each worker.
+        let mut net = net;
+        if job_value(&job, "tc").unwrap_or(0.0) > 0.0 && !net.tc_enabled() {
+            eprintln!("switching to TC learning");
+            net.enable_tc();
+        }
 
         // Train one chunk.
         let alpha = job_value(&job, "alpha").unwrap_or(0.00015625) as f32;

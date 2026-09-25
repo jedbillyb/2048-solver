@@ -16,7 +16,7 @@ const USAGE: &str = "usage:
   g2048 serve --net FILE [--depth N] [--port 20480]
   g2048 coord --net MASTER --token-file F [--port 20490]      (hands out training work)
   g2048 worker --url URL --token-file F [--name N] [--threads N] [--cache DIR]
-  g2048 train OUT_FILE [games=1000000] [--resume FILE] [--alpha A] [--seed S] [--tc 1] [--stages 3] [--restart 0.5] [--tuples 4|8]";
+  g2048 train OUT_FILE [games=1000000] [--resume FILE] [--alpha A] [--seed S] [--tc 1] [--stages 3] [--restart 0.5] [--tuples 4|8] [--init 320000]";
 
 struct GameResult {
     score: u64,
@@ -235,7 +235,13 @@ fn train(args: &[String]) {
     let seed: u64 = flag(args, "--seed").unwrap_or(42);
     let mut net = match flag::<String>(args, "--resume") {
         Some(p) => NTuple::load(&p).unwrap_or_else(|e| panic!("loading {p}: {e}")),
-        None => NTuple::new(0.0, 1, if flag::<u8>(args, "--tuples") == Some(8) { &ntuple::TUPLES_8 } else { &ntuple::TUPLES_4 }),
+        None => {
+            let tuples: &[[usize; 6]] = if flag::<u8>(args, "--tuples") == Some(8) { &ntuple::TUPLES_8 } else { &ntuple::TUPLES_4 };
+            // Optimistic initialization: --init is the starting value of every board, spread
+            // evenly over the 8 symmetric lookups of each tuple (320000 in Guei et al.).
+            let init: f32 = flag(args, "--init").unwrap_or(0.0);
+            NTuple::new(init / (8 * tuples.len()) as f32, 1, tuples)
+        }
     };
     net.expand_stages(flag(args, "--stages").unwrap_or(1));
     let restart_p: f32 = flag(args, "--restart").unwrap_or(0.0);

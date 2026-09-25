@@ -11,8 +11,9 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::Mutex;
 
-/// Cells are row-major, 0 = top-left. The first four are the classic 4x6 set;
-/// the 8-tuple network adds four more shapes covering corners and diagonals.
+/// Cells are row-major, 0 = top-left. TUPLES_4 is Yeh's 4x6-tuple set; TUPLES_8 is
+/// Matsuzaki's 8x6-tuple set, the one behind the best published results (Guei et al. 2021).
+/// Saved files record their own tuples, so older nets with other shapes still load.
 pub const TUPLES_4: [[usize; 6]; 4] = [
     [0, 1, 2, 3, 4, 5],
     [4, 5, 6, 7, 8, 9],
@@ -20,14 +21,14 @@ pub const TUPLES_4: [[usize; 6]; 4] = [
     [4, 5, 6, 8, 9, 10],
 ];
 pub const TUPLES_8: [[usize; 6]; 8] = [
-    [0, 1, 2, 3, 4, 5],
-    [4, 5, 6, 7, 8, 9],
     [0, 1, 2, 4, 5, 6],
-    [4, 5, 6, 8, 9, 10],
-    [0, 1, 5, 6, 7, 10],
+    [4, 5, 6, 7, 8, 9],
+    [0, 1, 2, 3, 4, 5],
+    [2, 3, 4, 5, 6, 9],
     [0, 1, 2, 5, 9, 10],
-    [0, 1, 5, 9, 13, 14],
-    [0, 1, 5, 8, 9, 13],
+    [3, 4, 5, 6, 7, 8],
+    [1, 3, 4, 5, 6, 7],
+    [0, 1, 4, 8, 9, 10],
 ];
 const MAX_TUPLES: usize = 8;
 const TUPLE_SIZE: usize = 1 << 24;
@@ -98,6 +99,10 @@ impl NTuple {
             }
         }
         self.stages = n;
+    }
+
+    pub fn tc_enabled(&self) -> bool {
+        !self.tc.is_empty()
     }
 
     /// Switch on temporal coherence learning: each weight's step is scaled by
