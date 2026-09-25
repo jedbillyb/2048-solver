@@ -1,6 +1,16 @@
 #!/bin/sh
 # Shows every running g2048 job with progress and time left.
+# status.sh -w refreshes every 5 seconds until Ctrl+C.
 cd "$(dirname "$0")"
+if [ "$1" = "-w" ]; then
+  while true; do
+    out=$("$0")
+    clear
+    date +%T
+    echo "$out"
+    sleep 5
+  done
+fi
 found=0
 for pid in $(pgrep -x g2048); do
   found=1
