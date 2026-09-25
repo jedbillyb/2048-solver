@@ -6,6 +6,9 @@
 #   farm.sh job               current settings
 #   farm.sh set k=v [k=v..]   change settings (alpha, restart, secs, send_mb, pause)
 #   farm.sh pause | resume    stop / restart training on every machine
+#   farm.sh limit NAME N      run machine NAME on N threads (from its next round)
+#   farm.sh full NAME         back to every thread on NAME
+#   farm.sh kill NAME         close the worker on NAME (it needs a manual start after)
 #   farm.sh start | stop      this laptop's own worker
 set -e
 URL=https://server.jedbillyb.com/g2048
@@ -23,6 +26,10 @@ set_job() {
         job=$(printf '%s\n%s' "$job" "$kv")
     done
     printf '%s\n' "$job" | grep . | api --data-binary @- "$URL/job"
+}
+
+unset_job() {
+    api "$URL/job" | grep -v "^$1=" | api --data-binary @- "$URL/job"
 }
 
 worker_pid() { pgrep -f "release/g2048 worker" || true; }
@@ -44,6 +51,15 @@ case "$1" in
     job) api "$URL/job" ;;
     set) shift; set_job "$@" ;;
     pause) set_job pause=1 ;;
+    limit) set_job "threads.$2=$3" >/dev/null; echo "$2 will use $3 threads from its next round (up to 2 min)" ;;
+    full) unset_job "threads.$2" >/dev/null; echo "$2 back to full power from its next round (up to 2 min)" ;;
+    kill)
+        set_job "stop.$2=1" >/dev/null
+        echo "stopping $2 at the end of its round (up to 3 min)..."
+        i=0
+        until api "$URL/status" | grep -q "^$2 .*\(OFFLINE\|stopped\)" || [ $i -ge 36 ]; do sleep 5; i=$((i+1)); done
+        unset_job "stop.$2" >/dev/null
+        echo "done; start it again on the machine itself" ;;
     resume) set_job pause=0 ;;
     start)
         [ -n "$(worker_pid)" ] && { echo "already running"; exit 0; }
@@ -54,5 +70,5 @@ case "$1" in
         pid=$(worker_pid)
         [ -z "$pid" ] && { echo "not running"; exit 0; }
         kill $pid && echo "laptop worker stopped" ;;
-    *) sed -n '2,11p' "$0" | sed 's/^# //' ;;
+    *) sed -n '2,14p' "$0" | sed 's/^# //' ;;
 esac

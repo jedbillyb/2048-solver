@@ -692,12 +692,12 @@ impl SysSampler {
 }
 
 /// Reports what this worker is doing and its machine's load every 10 seconds.
-fn heartbeat(c: Client, name: String, threads: usize, state: Arc<Mutex<&'static str>>) {
+fn heartbeat(c: Client, name: String, threads: Arc<Mutex<usize>>, state: Arc<Mutex<&'static str>>) {
     let mut sampler = SysSampler { last_cpu: None };
     let empty = c.tmp.join("beat.bin");
     let _ = std::fs::write(&empty, b"");
     loop {
-        let mut q = format!("/beat?name={name}&threads={threads}&state={}", state.lock().unwrap());
+        let mut q = format!("/beat?name={name}&threads={}&state={}", threads.lock().unwrap(), state.lock().unwrap());
         for (k, v) in sampler.sample() {
             q += &format!("&{k}={v}");
         }
@@ -722,6 +722,8 @@ const BUILD: u32 = 2;
 pub const CHILD_ENV: &str = "G2048_WORKER_CHILD";
 /// The exit code a worker uses to ask its supervisor for the new build.
 const UPDATE_EXIT: i32 = 42;
+/// The exit code for `stop.NAME=1` in the job: the supervisor exits too.
+const STOP_EXIT: i32 = 43;
 
 /// Runs the worker as a child process and restarts it when it exits: after a crash, or
 /// with the new build when the job asks for one. On Windows it first swaps in the exe the
@@ -734,6 +736,10 @@ pub fn supervise(url: &str) {
         let started = Instant::now();
         let code = std::process::Command::new(&exe).args(&args).env(CHILD_ENV, "1").status().ok().and_then(|s| s.code());
         match code {
+            Some(STOP_EXIT) => {
+                eprintln!("stopped from the server");
+                return;
+            }
             Some(UPDATE_EXIT) => {
                 // Asked again right after an update: the new build isn't published yet.
                 if started.elapsed() < Duration::from_secs(300) {
@@ -782,10 +788,12 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
         .status();
     eprintln!("worker {me} using {threads} threads");
     let status = Arc::new(Mutex::new("starting"));
+    let cores = Arc::new(Mutex::new(threads));
     {
+        let cores = cores.clone();
         let c = Client { max_time: Some(20), ..c.clone() };
         let (name, status) = (name.clone(), status.clone());
-        std::thread::spawn(move || heartbeat(c, name, threads, status));
+        std::thread::spawn(move || heartbeat(c, name, cores, status));
     }
     let set = |s: &'static str| *status.lock().unwrap() = s;
 
@@ -834,6 +842,14 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
             }
             std::process::exit(UPDATE_EXIT);
         }
+        if job_value(&job, &format!("stop.{name}")).unwrap_or(0.0) > 0.0 {
+            set("stopped");
+            eprintln!("stopped from the server");
+            if let Some(h) = syncing.take() {
+                let _ = h.join();
+            }
+            std::process::exit(STOP_EXIT);
+        }
         if job_value(&job, "pause").unwrap_or(0.0) > 0.0 {
             set("paused");
             std::thread::sleep(Duration::from_secs(60));
@@ -874,6 +890,9 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
         let restart = job_value(&job, "restart").unwrap_or(0.5) as f32;
         let secs = job_value(&job, "secs").unwrap_or(120.0);
         let send_mb = job_value(&job, "send_mb").unwrap_or(16.0);
+        // `threads.NAME=N` in the job caps one machine's cores.
+        let threads = job_value(&job, &format!("threads.{name}")).map_or(threads, |t| (t as usize).clamp(1, threads));
+        *cores.lock().unwrap() = threads;
         let counters: Vec<AtomicU64> = (0..8).map(|_| AtomicU64::new(0)).collect();
         let start = Instant::now();
         set("training");
