@@ -508,6 +508,8 @@ struct Client {
     url: String,
     auth: String,
     tmp: std::path::PathBuf,
+    /// Seconds before curl gives up; None for the big transfers, which may take minutes.
+    max_time: Option<u32>,
 }
 
 impl Client {
@@ -517,6 +519,9 @@ impl Client {
         let url = format!("{}{path}", self.url);
         let mut cmd = std::process::Command::new("curl");
         cmd.args(["-sS", "--connect-timeout", "20", "-X", method, "-H", &self.auth, "-o"]).arg(&out).args(["-w", "%{http_code}"]);
+        if let Some(t) = self.max_time {
+            cmd.args(["--max-time", &t.to_string()]);
+        }
         if let Some(b) = body {
             cmd.args(["-H", "Content-Type: application/octet-stream", "--data-binary"]).arg(format!("@{}", b.display()));
         }
@@ -646,10 +651,26 @@ impl SysSampler {
              \"$c;$($o.TotalVisibleMemorySize);$($o.FreePhysicalMemory);$t;$p\"",
             std::process::id()
         );
-        let Ok(r) = std::process::Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).output() else {
+        // A hung WMI query must not stall the heartbeat: give up after 20 seconds.
+        let Ok(mut child) = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
             return Vec::new();
         };
-        let text = String::from_utf8_lossy(&r.stdout);
+        let start = Instant::now();
+        while child.try_wait().ok().flatten().is_none() {
+            if start.elapsed() > Duration::from_secs(20) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Vec::new();
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let mut text = String::new();
+        let _ = child.stdout.take().map(|mut o| o.read_to_string(&mut text));
         let f: Vec<Option<f64>> = text.trim().split(';').map(|x| x.trim().parse().ok()).collect();
         let get = |i: usize| f.get(i).copied().flatten();
         let mut out = Vec::new();
@@ -703,7 +724,7 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
     // Unique per run, so a restarted worker never skips deltas it didn't make itself.
     let me = format!("{name}-{:08x}", (nanos ^ std::process::id() as u64) as u32);
-    let c = Client { url: url.trim_end_matches('/').to_string(), auth: format!("Authorization: Bearer {token}"), tmp: cache.clone() };
+    let c = Client { url: url.trim_end_matches('/').to_string(), auth: format!("Authorization: Bearer {token}"), tmp: cache.clone(), max_time: None };
     let cached = cache.join("net.bin");
     let cached_seq = cache.join("net.seq");
     // Below normal priority still uses every core when the machine is idle, but lets the
@@ -715,7 +736,8 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
     eprintln!("worker {me} using {threads} threads");
     let status = Arc::new(Mutex::new("starting"));
     {
-        let (c, name, status) = (c.clone(), name.clone(), status.clone());
+        let c = Client { max_time: Some(20), ..c.clone() };
+        let (name, status) = (name.clone(), status.clone());
         std::thread::spawn(move || heartbeat(c, name, threads, status));
     }
     let set = |s: &'static str| *status.lock().unwrap() = s;
