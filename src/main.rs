@@ -51,6 +51,9 @@ fn play(ai: &ai::Ai, seed: u64) -> GameResult {
         moves += 1;
         b = spawn(nb, &mut rng);
     }
+    if std::env::var_os("G2048_SHOW_END").is_some() {
+        eprintln!("final board (score {score}):\n{}", board::print(b));
+    }
     GameResult { score, max_rank: max_rank(b), moves }
 }
 

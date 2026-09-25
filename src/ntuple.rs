@@ -108,6 +108,7 @@ impl NTuple {
 
     #[inline]
     fn indices(&self, b: Board, out: &mut [usize; 8 * MAX_TUPLES]) -> usize {
+        let b = downgrade(b);
         let base = self.stage(b) * self.stage_size();
         let mut n = 0;
         for (t, syms) in self.cells.iter().enumerate() {
@@ -200,6 +201,32 @@ impl NTuple {
         }
         Ok(net)
     }
+}
+
+/// Training never reaches 32768, so weights for that tile stay near 0 and the net would
+/// refuse the merge that makes it. Boards holding 32768 are therefore valued as the same
+/// board one step down: every tile above the largest missing rank is halved, which turns
+/// the fresh 32768 (whose 16384 just merged away) into a familiar 16384 position.
+#[inline]
+pub fn downgrade(b: Board) -> Board {
+    if max_rank(b) < 15 {
+        return b;
+    }
+    let mut present = 0u32;
+    for i in 0..16 {
+        present |= 1 << ((b >> (4 * i)) & 0xF);
+    }
+    let missing = match (1..15u32).rev().find(|r| present & (1 << r) == 0) {
+        Some(m) => m,
+        None => return b,
+    };
+    let mut out = 0u64;
+    for i in 0..16 {
+        let r = (b >> (4 * i)) & 0xF;
+        let r = if r as u32 > missing { r - 1 } else { r };
+        out |= r << (4 * i);
+    }
+    out
 }
 
 /// Boards seen the first time a game entered each stage >= 1, so training games
@@ -307,6 +334,15 @@ mod tests {
         let b: Board = 0x0000_0012_0341_1235;
         let v = net.value(b);
         assert!((net.value(transpose(b)) - v).abs() < 1e-2 * v.abs().max(1.0));
+    }
+
+    #[test]
+    fn downgrade_turns_fresh_32768_into_16384() {
+        // 32768, 8192, 4096 and a 2: no 16384 left, so 32768 -> 16384 and nothing else moves.
+        let b: Board = 0x0000_0000_1000_CDF0;
+        assert_eq!(downgrade(b), 0x0000_0000_1000_CDE0);
+        // Boards without 32768 are untouched.
+        assert_eq!(downgrade(0x0000_0000_1000_CDE0), 0x0000_0000_1000_CDE0);
     }
 
     #[test]
