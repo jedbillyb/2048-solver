@@ -10,6 +10,7 @@ use std::time::Instant;
 
 const USAGE: &str = "usage:
   g2048 bench [games=16] [seed=1] [--net FILE --depth N]
+  g2048 serve --net FILE [--depth N] [--port 20480]
   g2048 train OUT_FILE [games=1000000] [--resume FILE] [--alpha A] [--seed S] [--tc 1]";
 
 struct GameResult {
@@ -162,11 +163,64 @@ fn train(args: &[String]) {
     println!("saved {out}");
 }
 
+/// Board from 16 hex digits, one tile rank per cell, row-major from the top-left.
+fn parse_board(hex: &str) -> Option<Board> {
+    if hex.len() != 16 {
+        return None;
+    }
+    hex.chars().enumerate().try_fold(0u64, |b, (i, ch)| Some(b | (ch.to_digit(16)? as u64) << (4 * i)))
+}
+
+/// Tiny HTTP server for the browser bot: GET /move?b=<16 hex ranks> -> "up" | "down" | "left" | "right" | "none".
+fn serve(args: &[String]) {
+    use std::io::{BufRead, BufReader, Write};
+    let path: String = flag(args, "--net").unwrap_or_else(|| panic!("{USAGE}"));
+    let net = NTuple::load(&path).unwrap_or_else(|e| panic!("loading {path}: {e}"));
+    let ai = ai::Ai::with_net(Arc::new(net), flag(args, "--depth").unwrap_or(3));
+    let port: u16 = flag(args, "--port").unwrap_or(20480);
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("binding port");
+    println!("serving on http://127.0.0.1:{port}");
+    for stream in listener.incoming().flatten() {
+        let mut reader = BufReader::new(&stream);
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_err() {
+            continue;
+        }
+        // Drain headers so the browser sees a clean response.
+        let mut h = String::new();
+        while reader.read_line(&mut h).map_or(false, |n| n > 2) {
+            h.clear();
+        }
+        let target = line.split_whitespace().nth(1).unwrap_or("");
+        let body = match line.split_whitespace().next() {
+            Some("OPTIONS") => String::new(),
+            _ => match target.strip_prefix("/move?b=").and_then(parse_board) {
+                Some(b) => match ai.best_move(b) {
+                    Some(Dir::Up) => "up",
+                    Some(Dir::Down) => "down",
+                    Some(Dir::Left) => "left",
+                    Some(Dir::Right) => "right",
+                    None => "none",
+                }
+                .to_string(),
+                None => "bad request".to_string(),
+            },
+        };
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Private-Network: true\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = (&stream).write_all(resp.as_bytes());
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("bench") => bench(&args[1..]),
         Some("train") => train(&args[1..]),
+        Some("serve") => serve(&args[1..]),
         _ => eprintln!("{USAGE}"),
     }
 }

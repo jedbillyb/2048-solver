@@ -1,4 +1,4 @@
-# 2048-ai
+# 2048-solver
 
 An AI aiming for the highest possible score on [play2048.co](https://play2048.co).
 
@@ -15,6 +15,7 @@ cargo test --release
 cargo run --release -- train nets/main.bin 3000000          # self-play TD training, saves every ~100k games
 cargo run --release -- bench 16 --net nets/main.bin --depth 2 # expectimax on top of the net
 cargo run --release -- bench 16                               # hand-heuristic expectimax
+cargo run --release -- serve --net nets/main.bin --depth 3    # move server for the browser bot (127.0.0.1:20480)
 ```
 `bench` plays games in parallel and prints mean/median score and how often each tile was reached.
 Weights live in `nets/` (gitignored, ~270 MB each).
