@@ -17,6 +17,9 @@ const MAGIC: &[u8; 8] = b"2048NT01";
 
 pub struct NTuple {
     w: Vec<AtomicU32>,
+    /// Temporal coherence accumulators (sum of errors, sum of |errors|) per weight;
+    /// empty unless TC learning is enabled.
+    tc: Vec<(AtomicU32, AtomicU32)>,
     /// [tuple][symmetry] -> 6 cell indices
     cells: Vec<[[usize; 6]; 8]>,
 }
@@ -34,7 +37,13 @@ impl NTuple {
             .map(|t| std::array::from_fn(|s| t.map(|c| symmetries(c)[s])))
             .collect();
         let bits = init.to_bits();
-        NTuple { w: (0..BASE_TUPLES.len() * TUPLE_SIZE).map(|_| AtomicU32::new(bits)).collect(), cells }
+        NTuple { w: (0..BASE_TUPLES.len() * TUPLE_SIZE).map(|_| AtomicU32::new(bits)).collect(), tc: vec![], cells }
+    }
+
+    /// Switch on temporal coherence learning: each weight's step is scaled by
+    /// |sum of its errors| / sum of |errors|, so noisy weights slow down on their own.
+    pub fn enable_tc(&mut self) {
+        self.tc = (0..self.w.len()).map(|_| (AtomicU32::new(0), AtomicU32::new(0))).collect();
     }
 
     #[inline]
@@ -59,13 +68,23 @@ impl NTuple {
         ix.iter().map(|&i| f32::from_bits(self.w[i].load(Relaxed))).sum()
     }
 
-    /// Adds `delta` to every weight the board touches.
-    pub fn update(&self, b: Board, delta: f32) {
+    /// Moves every weight the board touches by `alpha * err` (scaled per weight under TC).
+    pub fn update(&self, b: Board, alpha: f32, err: f32) {
         let mut ix = [0; 32];
         self.indices(b, &mut ix);
+        let load = |a: &AtomicU32| f32::from_bits(a.load(Relaxed));
         for &i in &ix {
+            let mut step = alpha * err;
+            if let Some((e, a)) = self.tc.get(i) {
+                let (ev, av) = (load(e), load(a));
+                if av > 0.0 {
+                    step *= ev.abs() / av;
+                }
+                e.store((ev + err).to_bits(), Relaxed);
+                a.store((av + err.abs()).to_bits(), Relaxed);
+            }
             let w = &self.w[i];
-            w.store((f32::from_bits(w.load(Relaxed)) + delta).to_bits(), Relaxed);
+            w.store((load(w) + step).to_bits(), Relaxed);
         }
     }
 
@@ -123,13 +142,13 @@ pub fn train_episode(net: &NTuple, t: &Tables, rng: &mut Rng, alpha: f32) -> Epi
         match best {
             None => {
                 if let Some(p) = prev_after {
-                    net.update(p, alpha * (0.0 - net.value(p)));
+                    net.update(p, alpha, 0.0 - net.value(p));
                 }
                 return EpisodeStats { score, max_rank: max_rank(b) };
             }
             Some((after, r, v)) => {
                 if let Some(p) = prev_after {
-                    net.update(p, alpha * (v - net.value(p)));
+                    net.update(p, alpha, v - net.value(p));
                 }
                 score += r as u64;
                 prev_after = Some(after);
