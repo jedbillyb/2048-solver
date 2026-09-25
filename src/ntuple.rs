@@ -169,11 +169,14 @@ impl NTuple {
     }
 
     pub fn load(path: &str) -> std::io::Result<Self> {
-        let mut f = std::io::BufReader::new(std::fs::File::open(path)?);
+        Self::load_from(std::io::BufReader::new(std::fs::File::open(path)?))
+    }
+
+    pub fn load_from(mut f: impl Read) -> std::io::Result<Self> {
         let mut magic = [0u8; 8];
         f.read_exact(&mut magic)?;
         let mut buf = [0u8; 4];
-        let mut read_u32 = |f: &mut std::io::BufReader<std::fs::File>| -> std::io::Result<usize> {
+        let mut read_u32 = |f: &mut dyn Read| -> std::io::Result<usize> {
             f.read_exact(&mut buf)?;
             Ok(u32::from_le_bytes(buf) as usize)
         };
@@ -200,6 +203,33 @@ impl NTuple {
             w.store(u32::from_le_bytes(buf), Relaxed);
         }
         Ok(net)
+    }
+
+    /// Current weights, to diff against after some training.
+    pub fn snapshot(&self) -> Vec<f32> {
+        self.w.iter().map(|w| f32::from_bits(w.load(Relaxed))).collect()
+    }
+
+    /// (index, current - base) for every weight that differs from `base`.
+    pub fn diff(&self, base: &[f32]) -> Vec<(u32, f32)> {
+        self.w
+            .iter()
+            .zip(base)
+            .enumerate()
+            .filter_map(|(i, (w, &old))| {
+                let d = f32::from_bits(w.load(Relaxed)) - old;
+                (d != 0.0).then_some((i as u32, d))
+            })
+            .collect()
+    }
+
+    /// Adds a delta from `diff` (another machine's training) into these weights.
+    pub fn apply(&self, delta: &[(u32, f32)]) {
+        for &(i, d) in delta {
+            if let Some(w) = self.w.get(i as usize) {
+                w.store((f32::from_bits(w.load(Relaxed)) + d).to_bits(), Relaxed);
+            }
+        }
     }
 }
 
@@ -318,6 +348,38 @@ pub fn train_episode(net: &NTuple, t: &Tables, rng: &mut Rng, alpha: f32, pool: 
     }
 }
 
+/// Runs training episodes on `threads` threads until `games` have been played or
+/// `deadline` passes, handing each finished episode to `each` with its game number.
+pub fn train_parallel(
+    net: &NTuple,
+    pool: &RestartPool,
+    alpha: f32,
+    restart_p: f32,
+    seed: u64,
+    threads: usize,
+    games: u64,
+    deadline: Option<std::time::Instant>,
+    each: &(dyn Fn(u64, &EpisodeStats) + Sync),
+) {
+    let t = Tables::new();
+    let next = std::sync::atomic::AtomicU64::new(0);
+    std::thread::scope(|s| {
+        for tid in 0..threads as u64 {
+            let (t, next) = (&t, &next);
+            s.spawn(move || {
+                let mut rng = Rng((seed ^ (tid + 1)).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+                loop {
+                    let g = next.fetch_add(1, Relaxed);
+                    if g >= games || deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                        break;
+                    }
+                    each(g, &train_episode(net, t, &mut rng, alpha, pool, restart_p));
+                }
+            });
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +396,20 @@ mod tests {
         let b: Board = 0x0000_0012_0341_1235;
         let v = net.value(b);
         assert!((net.value(transpose(b)) - v).abs() < 1e-2 * v.abs().max(1.0));
+    }
+
+    #[test]
+    fn diff_then_apply_reproduces_training() {
+        let a = NTuple::new(0.0, 1, &TUPLES_4);
+        let b = NTuple::new(0.0, 1, &TUPLES_4);
+        let snap = a.snapshot();
+        let pool = RestartPool::new(1, 10);
+        train_parallel(&a, &pool, 0.01, 0.0, 3, 1, 20, None, &|_, _| {});
+        let delta = a.diff(&snap);
+        assert!(!delta.is_empty());
+        b.apply(&delta);
+        assert_eq!(a.snapshot(), b.snapshot());
+        assert!(a.diff(&b.snapshot()).is_empty());
     }
 
     #[test]

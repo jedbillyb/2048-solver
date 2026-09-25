@@ -1,5 +1,6 @@
 mod ai;
 mod board;
+mod dist;
 mod ntuple;
 
 use board::*;
@@ -13,6 +14,8 @@ const USAGE: &str = "usage:
   g2048 positions OUT_FILE [count=64] --net FILE [--depth 2]   (boards where 16384 first appears)
   g2048 endgame POS_FILE --net FILE [--depth N] [--cprob P]     (play saved boards to the end)
   g2048 serve --net FILE [--depth N] [--port 20480]
+  g2048 coord --net MASTER --token-file F [--port 20490]      (hands out training work)
+  g2048 worker --url URL --token-file F [--name N] [--threads N] [--cache DIR]
   g2048 train OUT_FILE [games=1000000] [--resume FILE] [--alpha A] [--seed S] [--tc 1] [--stages 3] [--restart 0.5] [--tuples 4|8]";
 
 struct GameResult {
@@ -81,9 +84,12 @@ fn report(results: &[GameResult], secs: f64, threads: usize) {
     println!("reached 65536: {:>5.1}%", 100.0 * won as f64 / n);
 }
 
-/// Net-backed AI from --net / --depth / --endgame-depth / --cprob.
+/// Net-backed AI from --net / --depth / --endgame-depth / --cprob,
+/// or the hand-tuned heuristic with adaptive depth when --net is absent.
 fn net_ai(args: &[String], default_depth: u32) -> ai::Ai {
-    let path: String = flag(args, "--net").unwrap_or_else(|| panic!("{USAGE}"));
+    let Some(path) = flag::<String>(args, "--net") else {
+        return ai::Ai::new().with_cprob(flag(args, "--cprob"));
+    };
     let net = NTuple::load(&path).unwrap_or_else(|e| panic!("loading {path}: {e}"));
     ai::Ai::with_net(Arc::new(net), flag(args, "--depth").unwrap_or(default_depth))
         .with_endgame_depth(flag(args, "--endgame-depth"))
@@ -233,61 +239,40 @@ fn train(args: &[String]) {
     };
     net.expand_stages(flag(args, "--stages").unwrap_or(1));
     let restart_p: f32 = flag(args, "--restart").unwrap_or(0.0);
-    let pool = Arc::new(ntuple::RestartPool::new(net.stages(), 100_000));
+    let pool = ntuple::RestartPool::new(net.stages(), 100_000);
     if flag::<u8>(args, "--tc") == Some(1) {
         net.enable_tc();
     }
     // Per-weight step: 0.1 spread over the weights each board touches (8 per tuple).
     let alpha = alpha_flag.unwrap_or(0.1 / (8 * net.tuple_count()) as f32);
-    let net = Arc::new(net);
-    let tables = Arc::new(Tables::new());
-    let nt = threads(games);
-    let next = Arc::new(AtomicU64::new(0));
     const WINDOW: u64 = 10_000;
-    static WINDOWS_DONE: AtomicU64 = AtomicU64::new(0);
+    let windows_done = AtomicU64::new(0);
     // Per-window tallies: [score sum, games, >=2048, >=4096, >=8192, >=16384]
-    let stats: Arc<Vec<AtomicU64>> = Arc::new((0..6).map(|_| AtomicU64::new(0)).collect());
+    let stats: Vec<AtomicU64> = (0..6).map(|_| AtomicU64::new(0)).collect();
     let start = Instant::now();
-    let handles: Vec<_> = (0..nt as u64)
-        .map(|tid| {
-            let (net, tables, next, stats, out, pool) =
-                (net.clone(), tables.clone(), next.clone(), stats.clone(), out.clone(), pool.clone());
-            std::thread::spawn(move || {
-                let mut rng = Rng((seed ^ (tid + 1)).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-                loop {
-                    let g = next.fetch_add(1, Ordering::Relaxed);
-                    if g >= games {
-                        break;
-                    }
-                    let e = ntuple::train_episode(&net, &tables, &mut rng, alpha, &pool, restart_p);
-                    // Only fresh games say how strong the net is; restarts begin mid-game.
-                    if !e.fresh {
-                        continue;
-                    }
-                    stats[0].fetch_add(e.score, Ordering::Relaxed);
-                    for (i, k) in [11u8, 12, 13, 14].iter().enumerate() {
-                        if e.max_rank >= *k {
-                            stats[2 + i].fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    if stats[1].fetch_add(1, Ordering::Relaxed) + 1 == WINDOW {
-                        let v: Vec<u64> = stats.iter().map(|s| s.swap(0, Ordering::Relaxed)).collect();
-                        let pct = |x: u64| 100.0 * x as f64 / v[1] as f64;
-                        println!(
-                            "{:>9} games {:>6.0}s  mean {:>7.0}  2048 {:>5.1}%  4096 {:>5.1}%  8192 {:>5.1}%  16384 {:>4.1}%  pool {:?}",
-                            g + 1, start.elapsed().as_secs_f64(), v[0] as f64 / v[1] as f64, pct(v[2]), pct(v[3]), pct(v[4]), pct(v[5]), pool.sizes()
-                        );
-                        if WINDOWS_DONE.fetch_add(1, Ordering::Relaxed) % 10 == 9 {
-                            net.save(&out).expect("saving weights");
-                        }
-                    }
-                }
-            })
-        })
-        .collect();
-    for h in handles {
-        h.join().unwrap();
-    }
+    ntuple::train_parallel(&net, &pool, alpha, restart_p, seed, threads(games), games, None, &|g, e| {
+        // Only fresh games say how strong the net is; restarts begin mid-game.
+        if !e.fresh {
+            return;
+        }
+        stats[0].fetch_add(e.score, Ordering::Relaxed);
+        for (i, k) in [11u8, 12, 13, 14].iter().enumerate() {
+            if e.max_rank >= *k {
+                stats[2 + i].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if stats[1].fetch_add(1, Ordering::Relaxed) + 1 == WINDOW {
+            let v: Vec<u64> = stats.iter().map(|s| s.swap(0, Ordering::Relaxed)).collect();
+            let pct = |x: u64| 100.0 * x as f64 / v[1] as f64;
+            println!(
+                "{:>9} games {:>6.0}s  mean {:>7.0}  2048 {:>5.1}%  4096 {:>5.1}%  8192 {:>5.1}%  16384 {:>4.1}%  pool {:?}",
+                g + 1, start.elapsed().as_secs_f64(), v[0] as f64 / v[1] as f64, pct(v[2]), pct(v[3]), pct(v[4]), pct(v[5]), pool.sizes()
+            );
+            if windows_done.fetch_add(1, Ordering::Relaxed) % 10 == 9 {
+                net.save(&out).expect("saving weights");
+            }
+        }
+    });
     net.save(&out).expect("saving weights");
     println!("saved {out}");
 }
@@ -344,6 +329,14 @@ fn serve(args: &[String]) {
     }
 }
 
+/// Shared secret from --token-file (or --token), so it stays out of shell history and ps.
+fn token(args: &[String]) -> String {
+    match flag::<String>(args, "--token-file") {
+        Some(f) => std::fs::read_to_string(&f).unwrap_or_else(|e| panic!("reading {f}: {e}")).trim().to_string(),
+        None => flag(args, "--token").unwrap_or_else(|| panic!("{USAGE}")),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -352,6 +345,16 @@ fn main() {
         Some("serve") => serve(&args[1..]),
         Some("positions") => positions(&args[1..]),
         Some("endgame") => endgame(&args[1..]),
+        Some("coord") => {
+            let a = &args[1..];
+            dist::coord(flag(a, "--net").unwrap_or_else(|| panic!("{USAGE}")), token(a), flag(a, "--port").unwrap_or(20490))
+        }
+        Some("worker") => {
+            let a = &args[1..];
+            let url = flag(a, "--url").unwrap_or_else(|| panic!("{USAGE}"));
+            let cache = flag::<String>(a, "--cache").unwrap_or_else(|| "g2048-cache".into());
+            dist::worker(url, token(a), flag(a, "--name"), flag(a, "--threads").unwrap_or_else(|| threads(u64::MAX)), cache.into())
+        }
         _ => eprintln!("{USAGE}"),
     }
 }

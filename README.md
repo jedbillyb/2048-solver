@@ -20,6 +20,19 @@ cargo run --release -- serve --net nets/main.bin --depth 3    # move server for 
 `bench` plays games in parallel and prints mean/median score and how often each tile was reached.
 Weights live in `nets/` (gitignored, ~270 MB each).
 
+## Training on several machines
+
+`g2048 coord` holds the master net on an always-on server; `g2048 worker` runs on any
+number of machines (Linux or Windows), trains its own copy in 2-minute chunks, uploads
+only the largest weight changes (capped at `send_mb`, the rest carries over to the next
+chunk) and pulls everyone else's. Workers speak HTTPS through the system `curl`.
+
+```sh
+g2048 coord --net nets/master.bin --token-file ~/.config/g2048/token   # server, behind nginx /g2048/
+g2048 worker --url https://HOST/g2048 --token-file TOKEN_FILE          # each machine
+farm/farm.sh status | pause | resume | set alpha=0.0001 | start | stop # control from anywhere
+```
+
 ## Results so far
 | Player | Games | Mean score | 4096 | 8192 | 16384 |
 |---|---|---|---|---|---|
