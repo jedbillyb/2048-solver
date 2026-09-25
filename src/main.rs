@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const USAGE: &str = "usage:
-  g2048 bench [games=16] [seed=1] [--net FILE --depth N]
+  g2048 bench [games=16] [seed=1] [--net FILE --depth N [--endgame-depth N]]
   g2048 serve --net FILE [--depth N] [--port 20480]
   g2048 train OUT_FILE [games=1000000] [--resume FILE] [--alpha A] [--seed S] [--tc 1] [--stages 3] [--restart 0.5] [--tuples 4|8]";
 
@@ -74,7 +74,7 @@ fn bench(args: &[String]) {
     let ai = Arc::new(match flag::<String>(args, "--net") {
         Some(path) => {
             let net = NTuple::load(&path).unwrap_or_else(|e| panic!("loading {path}: {e}"));
-            ai::Ai::with_net(Arc::new(net), flag(args, "--depth").unwrap_or(2))
+            ai::Ai::with_net(Arc::new(net), flag(args, "--depth").unwrap_or(2)).with_endgame_depth(flag(args, "--endgame-depth"))
         }
         None => ai::Ai::new(),
     });
@@ -186,7 +186,7 @@ fn serve(args: &[String]) {
     use std::io::{BufRead, BufReader, Write};
     let path: String = flag(args, "--net").unwrap_or_else(|| panic!("{USAGE}"));
     let net = NTuple::load(&path).unwrap_or_else(|e| panic!("loading {path}: {e}"));
-    let ai = ai::Ai::with_net(Arc::new(net), flag(args, "--depth").unwrap_or(3));
+    let ai = ai::Ai::with_net(Arc::new(net), flag(args, "--depth").unwrap_or(3)).with_endgame_depth(flag(args, "--endgame-depth"));
     let port: u16 = flag(args, "--port").unwrap_or(20480);
     let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("binding port");
     println!("serving on http://127.0.0.1:{port}");

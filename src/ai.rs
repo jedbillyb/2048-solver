@@ -23,6 +23,8 @@ pub struct Ai {
     net: Option<Arc<NTuple>>,
     /// Fixed search depth in chance layers; None = heuristic's adaptive depth.
     depth: Option<u32>,
+    /// Deeper search once a 16384 is on the board, where the final merge chain is won or lost.
+    endgame_depth: Option<u32>,
 }
 
 struct Search<'a> {
@@ -66,11 +68,16 @@ fn row_heur(row: u16) -> f32 {
 
 impl Ai {
     pub fn new() -> Self {
-        Ai { t: Tables::new(), heur: (0..=u16::MAX).map(row_heur).collect(), net: None, depth: None }
+        Ai { t: Tables::new(), heur: (0..=u16::MAX).map(row_heur).collect(), net: None, depth: None, endgame_depth: None }
     }
 
     pub fn with_net(net: Arc<NTuple>, depth: u32) -> Self {
         Ai { net: Some(net), depth: Some(depth.max(1)), ..Ai::new() }
+    }
+
+    pub fn with_endgame_depth(mut self, d: Option<u32>) -> Self {
+        self.endgame_depth = d;
+        self
     }
 
     /// What a move is worth on top of its afterstate value.
@@ -93,7 +100,11 @@ impl Ai {
 
     /// Best legal move, or None if the game is over.
     pub fn best_move(&self, b: Board) -> Option<Dir> {
-        let mut s = Search { ai: self, depth_limit: self.depth.unwrap_or_else(|| distinct_tiles(b).saturating_sub(2).max(3)), tt: HashMap::new() };
+        let mut s = Search { ai: self, depth_limit: match (self.endgame_depth, self.depth) {
+                (Some(e), _) if max_rank(b) >= 14 => e,
+                (_, Some(d)) => d,
+                _ => distinct_tiles(b).saturating_sub(2).max(3),
+            }, tt: HashMap::new() };
         let mut best: Option<(Dir, f32)> = None;
         for d in DIRS {
             let (nb, r) = self.t.apply(b, d);
