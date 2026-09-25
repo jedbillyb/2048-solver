@@ -1,6 +1,6 @@
 # play2048.co rules (extracted from site JS, 2026-09-25)
 
-Source: `research/MessageBroker-CKyJubRq.js` (bundle fetched from play2048.co/assets).
+Source: the site's JS bundle (`/assets/MessageBroker-*.js`), not redistributed here.
 
 ## Core game (same in every mode)
 - 4x4 board, starts with 2 random tiles.
