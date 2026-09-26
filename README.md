@@ -66,7 +66,7 @@ g2048 worker --url https://HOST/g2048 --token-file TOKEN_FILE       # each machi
 `farm/farm.sh` controls the farm from any machine with the token:
 ```
 farm watch | status               live overview / once
-farm dell                         the PowerShell command to start a Windows worker
+farm dell                         admin PowerShell command: installs a Windows worker as a boot task
 farm job | set k=v                show / change the job
 farm pause | resume               every machine
 farm limit NAME N | full NAME     thread cap for one machine
@@ -85,5 +85,5 @@ farm start | stop                 this laptop's own worker
 | Same, depth 3 | 8 | 304,457 | 100% | 100% | 75.0% | 0% |
 | OTD 8-tuple net at 51.6M games (farm), 1-ply greedy | recent chunks | 288,598 | 98.2% | 93.2% | 74.2% | 0.05% |
 
-Best single game so far: **618,084 with the 32768 tile** (OTD net at 51.6M games, 1-ply
+Best single game so far: **628,908 with the 32768 tile** (OTD net at 52M games, 1-ply
 greedy, no search).
