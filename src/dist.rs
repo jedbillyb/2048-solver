@@ -865,8 +865,16 @@ pub fn supervise(url: &str) {
                         .arg(format!("{}/files/g2048.exe", url.trim_end_matches('/')))
                         .status()
                         .is_ok_and(|s| s.success());
-                    let old = exe.with_extension("old.exe");
-                    let _ = std::fs::remove_file(&old);
+                    // This supervisor keeps running from the exe it renamed in an earlier
+                    // update, and Windows won't delete or replace that file, so each swap
+                    // gets a fresh name and old ones are cleared once nothing runs them.
+                    let dir = exe.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+                    for f in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                        if f.file_name().to_string_lossy().starts_with("g2048.old") {
+                            let _ = std::fs::remove_file(f.path());
+                        }
+                    }
+                    let old = exe.with_extension(format!("old-{}.exe", unix_now()));
                     if !got || std::fs::rename(&exe, &old).is_err() || std::fs::rename(&new, &exe).is_err() {
                         eprintln!("update failed, restarting the current version in 60s");
                         std::thread::sleep(Duration::from_secs(60));
