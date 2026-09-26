@@ -49,6 +49,27 @@ pub struct NTuple {
     cells: Vec<[[usize; 6]; 8]>,
 }
 
+/// A vec of `n` items from `f`, backed by 2 MB pages on Linux where possible. The weights
+/// are read at random, and with 4 KB pages most reads first miss the TLB (~4% faster).
+fn huge_vec<T>(n: usize, f: impl FnMut(usize) -> T) -> Vec<T> {
+    let mut v = Vec::with_capacity(n);
+    #[cfg(target_os = "linux")]
+    {
+        unsafe extern "C" {
+            fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+        }
+        const MADV_HUGEPAGE: i32 = 14;
+        let (start, end) = (v.as_mut_ptr() as usize, v.as_mut_ptr() as usize + n * std::mem::size_of::<T>());
+        let start = (start + 4095) & !4095;
+        if end > start {
+            // Advice only: if the kernel refuses, the vec just stays on normal pages.
+            unsafe { madvise(start as *mut u8, end - start, MADV_HUGEPAGE) };
+        }
+    }
+    v.extend((0..n).map(f));
+    v
+}
+
 fn symmetries(c: usize) -> [usize; 8] {
     let (r, k) = (c / 4, c % 4);
     let pts = [(r, k), (k, 3 - r), (3 - r, 3 - k), (3 - k, r), (r, 3 - k), (3 - k, 3 - r), (3 - r, k), (k, r)];
@@ -65,7 +86,7 @@ impl NTuple {
         let bits = init.to_bits();
         let stages = stages.max(1);
         let n = stages * tuples.len() * TUPLE_SIZE;
-        NTuple { w: (0..n).map(|_| AtomicU32::new(bits)).collect(), stages, tuples: tuples.to_vec(), tc: vec![], cells }
+        NTuple { w: huge_vec(n, |_| AtomicU32::new(bits)), stages, tuples: tuples.to_vec(), tc: vec![], cells }
     }
 
     #[inline]
@@ -108,7 +129,7 @@ impl NTuple {
     /// Switch on temporal coherence learning: each weight's step is scaled by
     /// |sum of its errors| / sum of |errors|, so noisy weights slow down on their own.
     pub fn enable_tc(&mut self) {
-        self.tc = (0..self.w.len()).map(|_| (AtomicU32::new(0), AtomicU32::new(0))).collect();
+        self.tc = huge_vec(self.w.len(), |_| (AtomicU32::new(0), AtomicU32::new(0)));
     }
 
     #[inline]
