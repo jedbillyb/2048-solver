@@ -2,7 +2,7 @@
 # Control the training farm from any machine holding ~/.config/g2048/token.
 #   farm.sh watch             live overview of every machine (refreshes every 5s)
 #   farm.sh status            the same, once
-#   farm.sh dell              the command to paste into PowerShell on a Windows PC
+#   farm.sh dell              command for an admin PowerShell: installs a Windows worker as a boot task
 #   farm.sh job               current settings
 #   farm.sh set k=v [k=v..]   change settings (alpha, restart, secs, send_mb, pause)
 #   farm.sh pause | resume    stop / restart training on every machine
@@ -45,9 +45,11 @@ case "$1" in
     status) overview ;;
     watch) while :; do out=$(overview 2>&1); clear; printf '%s\n' "$out"; sleep 5; done ;;
     dell)
-        echo "Paste into PowerShell on the Dell (keep the window open; closing it stops training):"
+        echo "Paste into PowerShell opened as Administrator on the Windows PC. It installs the worker"
+        echo "as a scheduled task: starts at boot with no login, restarts itself if it stops,"
+        echo "and updates itself. Safe to re-run; it replaces the old worker."
         echo
-        echo "mkdir -Force \$HOME\\g2048 | Out-Null; cd \$HOME\\g2048; iwr https://server.jedbillyb.com/g2048/files/g2048.exe -OutFile g2048.exe; powercfg /change standby-timeout-ac 0; .\\g2048.exe worker --url $URL --token $(cat "$TOKEN_FILE") --cache cache" ;;
+        echo "\$d=\"\$HOME\\g2048\"; mkdir -Force \$d | Out-Null; cd \$d; Stop-ScheduledTask g2048-worker -ErrorAction SilentlyContinue; Stop-Process -Name g2048 -Force -ErrorAction SilentlyContinue; Start-Sleep 2; Remove-Item g2048.old*.exe,g2048.new.exe -ErrorAction SilentlyContinue; iwr $URL/files/g2048.exe -OutFile g2048.exe; powercfg /change standby-timeout-ac 0; \$a=New-ScheduledTaskAction -Execute \"\$d\\g2048.exe\" -Argument \"worker --url $URL --token $(cat "$TOKEN_FILE") --cache cache\" -WorkingDirectory \$d; \$s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; Register-ScheduledTask g2048-worker -Action \$a -Trigger (New-ScheduledTaskTrigger -AtStartup) -Settings \$s -User SYSTEM -RunLevel Highest -Force | Out-Null; Start-ScheduledTask g2048-worker; 'g2048 worker installed and running'" ;;
     job) api "$URL/job" ;;
     set) shift; set_job "$@" ;;
     pause) set_job pause=1 ;;

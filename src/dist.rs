@@ -1009,7 +1009,10 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
         // default) still uses every core when idle but lets the desktop go first.
         #[cfg(windows)]
         {
-            let want = job_text(&job, &format!("priority.{name}")).unwrap_or("BelowNormal").to_string();
+            // Only a known class name ever reaches PowerShell.
+            const CLASSES: [&str; 6] = ["Idle", "BelowNormal", "Normal", "AboveNormal", "High", "RealTime"];
+            let asked = job_text(&job, &format!("priority.{name}")).unwrap_or("BelowNormal");
+            let want = CLASSES.iter().find(|c| c.eq_ignore_ascii_case(asked)).unwrap_or(&"BelowNormal").to_string();
             if want != priority {
                 let _ = std::process::Command::new("powershell")
                     .args(["-NoProfile", "-NonInteractive", "-Command", &format!("(Get-Process -Id {}).PriorityClass='{want}'", std::process::id())])
