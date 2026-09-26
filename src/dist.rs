@@ -99,7 +99,8 @@ fn job_value(job: &str, key: &str) -> Option<f64> {
     job.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('=')?.trim().parse().ok())
 }
 
-/// Totals of the fresh games in one training chunk: reached counts are for 2048 .. 32768.
+/// Totals of the fresh games in one training chunk: reached counts are for 2048 .. 32768,
+/// `best` and `top` are the chunk's highest score and tile rank.
 #[derive(Clone, Copy, Default)]
 struct Chunk {
     secs: f64,
@@ -107,12 +108,14 @@ struct Chunk {
     fresh: u64,
     score: u64,
     reached: [u64; 5],
+    best: u64,
+    top: u8,
 }
 
 impl Chunk {
     fn to_query(self) -> String {
         let r = self.reached.map(|x| x.to_string()).join(",");
-        format!("secs={:.1}&episodes={}&fresh={}&score={}&reached={r}", self.secs, self.episodes, self.fresh, self.score)
+        format!("secs={:.1}&episodes={}&fresh={}&score={}&reached={r}&best={}&top={}", self.secs, self.episodes, self.fresh, self.score, self.best, self.top)
     }
 
     fn from_query(q: &HashMap<String, String>) -> Chunk {
@@ -121,7 +124,7 @@ impl Chunk {
         for (slot, v) in reached.iter_mut().zip(q.get("reached").map_or("", |s| s).split(',')) {
             *slot = v.parse().unwrap_or(0);
         }
-        Chunk { secs: num("secs"), episodes: num("episodes") as u64, fresh: num("fresh") as u64, score: num("score") as u64, reached }
+        Chunk { secs: num("secs"), episodes: num("episodes") as u64, fresh: num("fresh") as u64, score: num("score") as u64, reached, best: num("best") as u64, top: num("top") as u8 }
     }
 
     fn add(&mut self, o: &Chunk) {
@@ -132,6 +135,8 @@ impl Chunk {
         for (a, b) in self.reached.iter_mut().zip(o.reached) {
             *a += b;
         }
+        self.best = self.best.max(o.best);
+        self.top = self.top.max(o.top);
     }
 
     fn rate(&self) -> f64 {
@@ -174,6 +179,8 @@ struct Coord {
     workers: HashMap<String, WorkerInfo>,
     /// Training games since the net was created, kept in `path.episodes` across restarts.
     episodes: u64,
+    /// Best training game so far: (score, tile rank, machine, unix time), kept in `path.best`.
+    record: Option<(u64, u8, String, u64)>,
 }
 
 impl Coord {
@@ -220,6 +227,22 @@ impl Coord {
         out
     }
 
+    /// Writes the delta log next to the net, for `load_log` after a restart.
+    fn save_log(&self) -> std::io::Result<()> {
+        let path = format!("{}.log", self.path);
+        let mut f = std::io::BufWriter::new(std::fs::File::create(format!("{path}.tmp"))?);
+        for d in &self.log {
+            f.write_all(&d.seq.to_le_bytes())?;
+            f.write_all(&(d.from.len() as u32).to_le_bytes())?;
+            f.write_all(d.from.as_bytes())?;
+            f.write_all(&(d.bytes.len() as u32).to_le_bytes())?;
+            f.write_all(&d.bytes)?;
+        }
+        f.flush()?;
+        drop(f);
+        std::fs::rename(format!("{path}.tmp"), path)
+    }
+
     fn status(&self, color: bool) -> String {
         let paint = |code: &str, text: String| if color { format!("\x1b[{code}m{text}\x1b[0m") } else { text };
         let effective = self.effective_job();
@@ -239,9 +262,14 @@ impl Coord {
             if job_text(&self.job, "schedule") == Some("otd") { " (auto: OTD schedule)" } else { "" },
             if job("tc").unwrap_or(0.0) > 0.0 { "on" } else { "off" },
             if job("pause").unwrap_or(0.0) > 0.0 { paint("33", "   PAUSED".into()) } else { String::new() });
-        s += &format!("progress  {}{}  {:.1}%  {} / {} games  ETA {eta}\n\n",
+        s += &format!("progress  {}{}  {:.1}%  {} / {} games  ETA {eta}\n",
             paint("32", "#".repeat(bar)), paint("2", ".".repeat(30 - bar)), done * 100.0,
             millions(self.episodes as f64), millions(goal));
+        if let Some((score, rank, who, at)) = &self.record {
+            let ago = duration(unix_now().saturating_sub(*at) as f64);
+            s += &format!("best game {}  ({} tile)  by {who}, {ago} ago\n", paint("1;32", thousands(*score as f64)), 1u64 << rank);
+        }
+        s += "\n";
 
         // Machines: what each is doing and how hard it is working.
         let mut names: Vec<_> = self.workers.keys().collect();
@@ -281,14 +309,14 @@ impl Coord {
 
         // Training results, from each worker's recent chunks.
         s += "\n";
-        s += &paint("1", format!("{:<12}{:>9}{:>12}{:>8}{:>8}{:>8}{:>8}{:>8}", "RESULTS", "games/s", "mean score", "2048", "4096", "8192", "16384", "32768"));
+        s += &paint("1", format!("{:<12}{:>9}{:>12}{:>8}{:>8}{:>8}{:>8}{:>8}{:>12}", "RESULTS", "games/s", "mean score", "2048", "4096", "8192", "16384", "32768", "best"));
         s += "\n";
         let row = |label: &str, c: &Chunk, rate: f64| {
             let pct = |x: u64| if c.fresh == 0 { 0.0 } else { 100.0 * x as f64 / c.fresh as f64 };
             let r = c.reached;
             let mean = if c.fresh == 0 { 0.0 } else { c.score as f64 / c.fresh as f64 };
-            format!("{label:<12}{:>9}{:>12}{:>7.1}%{:>7.1}%{:>7.1}%{:>7.2}%{:>7.2}%\n",
-                thousands(rate), thousands(mean), pct(r[0]), pct(r[1]), pct(r[2]), pct(r[3]), pct(r[4]))
+            format!("{label:<12}{:>9}{:>12}{:>7.1}%{:>7.1}%{:>7.1}%{:>7.2}%{:>7.2}%{:>12}\n",
+                thousands(rate), thousands(mean), pct(r[0]), pct(r[1]), pct(r[2]), pct(r[3]), pct(r[4]), thousands(c.best as f64))
         };
         let mut total = Chunk::default();
         for name in &names {
@@ -305,7 +333,7 @@ impl Coord {
         }
         s += &paint("1", row("ALL", &total, rate));
         s += &paint("2", format!(
-            "\nmaster: update {}, saved {} ago, {} updates held ({} MB). Scores are over each machine's last {RECENT} chunks.\n",
+            "\nmaster: update {}, saved {} ago, {} updates held ({} MB). Scores and best are over each machine's last {RECENT} chunks.\n",
             self.seq, duration(self.saved_at.elapsed().as_secs_f64()), self.log.len(), self.log_bytes >> 20));
         s
     }
@@ -318,6 +346,39 @@ fn duration(secs: f64) -> String {
 
 fn millions(x: f64) -> String {
     if x >= 1e6 { format!("{:.1}M", x / 1e6) } else { format!("{:.0}k", x / 1e3) }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Reads a log written by `save_log`. It is used only if it runs right up to `seq`, the
+/// saved net's update number: a log with a gap would let a worker skip updates unnoticed.
+/// The file is removed either way, so a stale log can never be read by a later start.
+fn load_log(path: &str, seq: u64) -> (VecDeque<Delta>, usize) {
+    let Ok(data) = std::fs::read(path) else { return (VecDeque::new(), 0) };
+    let _ = std::fs::remove_file(path);
+    let mut log = VecDeque::new();
+    let mut bytes = 0;
+    let mut at = 0;
+    let mut take = |n: usize| {
+        let s = data.get(at..at + n)?;
+        at += n;
+        Some(s)
+    };
+    let u32_at = |s: &[u8]| u32::from_le_bytes(s.try_into().unwrap()) as usize;
+    while let Some(s) = take(8) {
+        let d_seq = u64::from_le_bytes(s.try_into().unwrap());
+        let Some(from) = take(4).map(u32_at).and_then(|n| take(n)) else { break };
+        let from = String::from_utf8_lossy(from).to_string();
+        let Some(body) = take(4).map(u32_at).and_then(|n| take(n)) else { break };
+        bytes += body.len();
+        log.push_back(Delta { seq: d_seq, from, bytes: Arc::new(body.to_vec()), at: Instant::now() });
+    }
+    if log.back().map(|d| d.seq) != Some(seq) {
+        return (VecDeque::new(), 0);
+    }
+    (log, bytes)
 }
 
 fn thousands(x: f64) -> String {
@@ -464,6 +525,11 @@ fn handle(mut stream: TcpStream, coord: &Mutex<Coord>, token: &str) -> std::io::
             let chunk = Chunk::from_query(&q);
             let mut c = coord.lock().unwrap();
             c.episodes += chunk.episodes;
+            if chunk.best > c.record.as_ref().map_or(0, |r| r.0) {
+                c.record = Some((chunk.best, chunk.top, name.clone(), unix_now()));
+                let (score, rank, who, at) = c.record.as_ref().unwrap();
+                let _ = std::fs::write(format!("{}.best", c.path), format!("{score} {rank} {who} {at}\n"));
+            }
             let w = c.workers.entry(name.clone()).or_insert_with(WorkerInfo::new);
             w.last_seen = Instant::now();
             w.total_episodes += chunk.episodes;
@@ -485,6 +551,19 @@ fn handle(mut stream: TcpStream, coord: &Mutex<Coord>, token: &str) -> std::io::
             drop(c);
             respond(&mut stream, 200, format!("{seq} {scale}").as_bytes());
         }
+        ("POST", "/shutdown") => {
+            // Save the net and the delta log, then exit; systemd starts the new binary, and
+            // workers carry on from the restored log instead of downloading the net again.
+            let mut c = coord.lock().unwrap();
+            c.save();
+            match c.save_log() {
+                Ok(()) => {
+                    respond(&mut stream, 200, format!("saved at seq {}, restarting\n", c.seq).as_bytes());
+                    std::process::exit(0);
+                }
+                Err(e) => respond(&mut stream, 500, format!("saving the delta log: {e}\n").as_bytes()),
+            }
+        }
         _ => respond(&mut stream, 404, b"no such endpoint\n"),
     }
     Ok(())
@@ -496,17 +575,24 @@ pub fn coord(net_path: String, token: String, port: u16) {
     let seq: u64 = std::fs::read_to_string(format!("{net_path}.seq")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
     let job = std::fs::read_to_string(format!("{net_path}.job")).unwrap_or_else(|_| DEFAULT_JOB.to_string());
     let episodes: u64 = std::fs::read_to_string(format!("{net_path}.episodes")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    let record = std::fs::read_to_string(format!("{net_path}.best")).ok().and_then(|s| {
+        let f: Vec<&str> = s.split_whitespace().collect();
+        Some((f.first()?.parse().ok()?, f.get(1)?.parse().ok()?, f.get(2)?.to_string(), f.get(3)?.parse().ok()?))
+    });
+    let (log, log_bytes) = load_log(&format!("{net_path}.log"), seq);
+    eprintln!("restored {} deltas ({} MB) of the log", log.len(), log_bytes >> 20);
     let coord = Arc::new(Mutex::new(Coord {
         net,
         path: net_path,
         seq,
         saved_seq: seq,
         saved_at: Instant::now(),
-        log: VecDeque::new(),
-        log_bytes: 0,
+        log,
+        log_bytes,
         job,
         workers: HashMap::new(),
         episodes,
+        record,
     }));
     let saver = coord.clone();
     std::thread::spawn(move || loop {
@@ -743,7 +829,7 @@ fn machine_name() -> String {
 }
 
 /// Workers older than the job's `version=` restart into the new build on their own.
-const BUILD: u32 = 4;
+const BUILD: u32 = 5;
 pub const CHILD_ENV: &str = "G2048_WORKER_CHILD";
 /// The exit code a worker uses to ask its supervisor for the new build.
 const UPDATE_EXIT: i32 = 42;
@@ -926,7 +1012,7 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
         // `threads.NAME=N` in the job caps one machine's cores.
         let threads = job_value(&job, &format!("threads.{name}")).map_or(threads, |t| (t as usize).clamp(1, threads));
         *cores.lock().unwrap() = threads;
-        let counters: Vec<AtomicU64> = (0..8).map(|_| AtomicU64::new(0)).collect();
+        let counters: Vec<AtomicU64> = (0..10).map(|_| AtomicU64::new(0)).collect();
         let start = Instant::now();
         set("training");
         seed = seed.wrapping_add(0x9E37_79B9);
@@ -940,10 +1026,12 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
                         counters[3 + k].fetch_add(1, Relaxed);
                     }
                 }
+                counters[8].fetch_max(e.score, Relaxed);
+                counters[9].fetch_max(e.max_rank as u64, Relaxed);
             }
         });
         let v: Vec<u64> = counters.iter().map(|a| a.load(Relaxed)).collect();
-        let chunk = Chunk { secs: start.elapsed().as_secs_f64(), episodes: v[0], fresh: v[1], score: v[2], reached: [v[3], v[4], v[5], v[6], v[7]] };
+        let chunk = Chunk { secs: start.elapsed().as_secs_f64(), episodes: v[0], fresh: v[1], score: v[2], reached: [v[3], v[4], v[5], v[6], v[7]], best: v[8], top: v[9] as u8 };
         drop(n);
 
         // The previous chunk's sync must land before this chunk's changes are measured.
