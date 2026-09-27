@@ -93,10 +93,11 @@ farm start | stop                 this laptop's own worker
 | OTD 8-tuple net at 51.6M games (farm), 1-ply greedy | recent chunks | 288,598 | 98.2% | 93.2% | 74.2% | 0.05% |
 | OTD stage 1, pre-TC (~80M games), 1-ply greedy | 200 | - | - | 98.5% | 92.0% | 0% |
 | Same, expectimax depth 2 | 200 | 334,883 | 100% | 99.5% | 95.5% | 0% |
+| OTD stage 2 at 7.7M games (farm), 1-ply greedy, fresh games | recent chunks | 291,383 | 98.5% | 94.7% | 79.7% | 1.41% |
 | OTD stage 1 after the TC phase (100M games), 1-ply greedy | 200 | - | - | 0% | 0% | 0% |
 
-Best single game so far: **731,912 with the 32768 tile** (farm training game on the
-OptiPlex, 1-ply greedy, no search).
+Best single game so far: **805,224 with the 32768 tile** (stage 2 farm training game on
+the laptop, 1-ply greedy, no search, 2026-09-28).
 
 Stage 1 alone stops at 16384: fresh games almost never get further, which is what stage 2
 is for.
