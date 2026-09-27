@@ -831,7 +831,7 @@ fn machine_name() -> String {
 }
 
 /// Workers older than the job's `version=` restart into the new build on their own.
-const BUILD: u32 = 6;
+const BUILD: u32 = 7;
 pub const CHILD_ENV: &str = "G2048_WORKER_CHILD";
 /// The exit code a worker uses to ask its supervisor for the new build.
 const UPDATE_EXIT: i32 = 42;
@@ -1000,6 +1000,10 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
             net = Some(Arc::new(n));
         }
         let n = net.clone().unwrap();
+        // A re-downloaded master can have more stages than the net the pool was made for.
+        if pool.as_ref().is_some_and(|p| p.sizes().len() != n.stages()) {
+            pool = None;
+        }
         let pool = pool.get_or_insert_with(|| RestartPool::new(n.stages(), 100_000));
 
         // Train one chunk. `freeze=N` keeps stages below N fixed while later stages learn.
