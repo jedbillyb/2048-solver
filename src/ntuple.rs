@@ -8,7 +8,7 @@
 
 use crate::board::*;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
 
 /// Cells are row-major, 0 = top-left. TUPLES_4 is Yeh's 4x6-tuple set; TUPLES_8 is
@@ -45,6 +45,8 @@ pub struct NTuple {
     /// Temporal coherence accumulators (sum of errors, sum of |errors|) per weight;
     /// empty unless TC learning is enabled.
     tc: Vec<(AtomicU32, AtomicU32)>,
+    /// Stages below this one are left as they are by `update` (later stages train on their own).
+    frozen: AtomicUsize,
     /// [tuple][symmetry] -> 6 cell indices
     cells: Vec<[[usize; 6]; 8]>,
 }
@@ -86,7 +88,7 @@ impl NTuple {
         let bits = init.to_bits();
         let stages = stages.max(1);
         let n = stages * tuples.len() * TUPLE_SIZE;
-        NTuple { w: huge_vec(n, |_| AtomicU32::new(bits)), stages, tuples: tuples.to_vec(), tc: vec![], cells }
+        NTuple { w: huge_vec(n, |_| AtomicU32::new(bits)), stages, tuples: tuples.to_vec(), tc: vec![], frozen: AtomicUsize::new(0), cells }
     }
 
     #[inline]
@@ -126,6 +128,11 @@ impl NTuple {
         !self.tc.is_empty()
     }
 
+    /// Stop `update` from touching stages below `s`.
+    pub fn set_frozen(&self, s: usize) {
+        self.frozen.store(s, Relaxed);
+    }
+
     /// Switch on temporal coherence learning: each weight's step is scaled by
     /// |sum of its errors| / sum of |errors|, so noisy weights slow down on their own.
     pub fn enable_tc(&mut self) {
@@ -161,6 +168,9 @@ impl NTuple {
     pub fn update(&self, b: Board, alpha: f32, err: f32) {
         let mut ix = [0; 8 * MAX_TUPLES];
         let n = self.indices(b, &mut ix);
+        if ix[0] / self.stage_size() < self.frozen.load(Relaxed) {
+            return;
+        }
         let load = |a: &AtomicU32| f32::from_bits(a.load(Relaxed));
         for &i in &ix[..n] {
             let mut step = alpha * err;

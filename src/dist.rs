@@ -210,17 +210,19 @@ impl Coord {
 
     /// The job as workers see it. With `schedule=otd`, alpha and TC follow the OTD recipe
     /// over the stage's `goal` episodes: per-weight alpha 0.1/64, cut 10x at 50% and again at
-    /// 75%, then TC learning (alpha 1.0/64) for the last 10%.
+    /// 75%.
     fn effective_job(&self) -> String {
         if job_text(&self.job, "schedule") != Some("otd") {
             return self.job.clone();
         }
         let done = self.episodes as f64 / job_value(&self.job, "goal").unwrap_or(100e6);
+        // No TC phase: its accumulators live on each worker, start at zero and reset on every
+        // restart, so each weight's first TC step is the full 1.0 rate. On 2026-09-27 that took
+        // the farm's mean score from 302k to 35k within an hour.
         let (alpha, tc) = match done {
             d if d < 0.5 => (0.1, 0),
             d if d < 0.75 => (0.01, 0),
-            d if d < 0.9 => (0.001, 0),
-            _ => (1.0, 1),
+            _ => (0.001, 0),
         };
         let mut out: String = self.job.lines().filter(|l| !l.starts_with("alpha=") && !l.starts_with("tc=")).map(|l| format!("{l}\n")).collect();
         out += &format!("alpha={}\ntc={tc}\n", alpha / 64.0);
@@ -829,7 +831,7 @@ fn machine_name() -> String {
 }
 
 /// Workers older than the job's `version=` restart into the new build on their own.
-const BUILD: u32 = 5;
+const BUILD: u32 = 6;
 pub const CHILD_ENV: &str = "G2048_WORKER_CHILD";
 /// The exit code a worker uses to ask its supervisor for the new build.
 const UPDATE_EXIT: i32 = 42;
@@ -1000,7 +1002,8 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
         let n = net.clone().unwrap();
         let pool = pool.get_or_insert_with(|| RestartPool::new(n.stages(), 100_000));
 
-        // Train one chunk.
+        // Train one chunk. `freeze=N` keeps stages below N fixed while later stages learn.
+        n.set_frozen(job_value(&job, "freeze").unwrap_or(0.0) as usize);
         let alpha = job_value(&job, "alpha").unwrap_or(0.00015625) as f32;
         let restart = job_value(&job, "restart").unwrap_or(0.5) as f32;
         let secs = job_value(&job, "secs").unwrap_or(120.0);
