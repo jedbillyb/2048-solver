@@ -20,8 +20,9 @@ without undo. Milestones on the way, with the records to beat:
 - [x] Expectimax with a hand-tuned heuristic (milestone 1)
 - [x] TD-trained n-tuple network (afterstate TD(0), 8 board symmetries)
 - [x] Distributed training farm (coordinator + workers on Linux and Windows)
-- [ ] OTD stage 1: Matsuzaki 8x6-tuple net, 100M games (running)
-- [ ] OTD stage 2: net for boards that already hold 16384
+- [x] OTD stage 1: Matsuzaki 8x6-tuple net, 100M games (finished 2026-09-28; the TC phase
+      broke it, so stage 1 is the pre-TC net, see below)
+- [ ] OTD stage 2: net for boards that already hold 16384 (running)
 - [ ] Deep search test (6-ply with tile downgrading)
 - [ ] Browser bot that plays play2048.co
 
@@ -50,8 +51,14 @@ g2048 worker --url https://HOST/g2048 --token-file TOKEN_FILE       # each machi
 ```
 
 - **Learning schedule:** with `schedule=otd` in the job, the coordinator follows the OTD
-  recipe over `goal` games: alpha 0.1, cut 10x at 50% and 75%, then TC learning for the
-  last 10%.
+  recipe over `goal` games: alpha 0.1, cut 10x at 50% and 75%. The paper's final TC phase
+  is left out on purpose: TC accumulators live on each worker, start at zero and reset on
+  every restart, so each weight's first TC step runs at the full rate. When stage 1 hit
+  90% on 2026-09-27 that took the farm's mean score from 302k to 35k within an hour.
+- **Stages:** `freeze=N` keeps stages below N fixed. Stage 2 runs with `freeze=1
+  restart=0.9`: 90% of games start from a saved board where 16384 first appeared and only
+  the stage-2 weights learn; the other 10% are fresh games that keep the pool of starting
+  boards varied.
 - **Auto-update:** a worker runs under a small supervisor. Bump `const BUILD` in
   `src/dist.rs`, publish the new binaries, then `farm set version=N`; every worker saves
   its net, updates (Windows downloads the new exe) and restarts on its own.
@@ -84,6 +91,12 @@ farm start | stop                 this laptop's own worker
 | 3-stage net, +1.7M games with endgame restarts, depth 2 | 32 | 336,879 | 100% | 100% | 93.8% | 0% |
 | Same, depth 3 | 8 | 304,457 | 100% | 100% | 75.0% | 0% |
 | OTD 8-tuple net at 51.6M games (farm), 1-ply greedy | recent chunks | 288,598 | 98.2% | 93.2% | 74.2% | 0.05% |
+| OTD stage 1, pre-TC (~80M games), 1-ply greedy | 200 | - | - | 98.5% | 92.0% | 0% |
+| Same, expectimax depth 2 | 200 | 334,883 | 100% | 99.5% | 95.5% | 0% |
+| OTD stage 1 after the TC phase (100M games), 1-ply greedy | 200 | - | - | 0% | 0% | 0% |
 
-Best single game so far: **628,908 with the 32768 tile** (OTD net at 52M games, 1-ply
-greedy, no search).
+Best single game so far: **731,912 with the 32768 tile** (farm training game on the
+OptiPlex, 1-ply greedy, no search).
+
+Stage 1 alone stops at 16384: fresh games almost never get further, which is what stage 2
+is for.
