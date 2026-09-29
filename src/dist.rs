@@ -6,7 +6,8 @@
 //! net. Workers talk HTTP through the system `curl` (shipped with Windows 10+ too), which
 //! keeps TLS out of this dependency-free crate; nginx terminates TLS for the coordinator.
 
-use crate::ntuple::{self, NTuple, RestartPool};
+use crate::board::Rng;
+use crate::ntuple::{self, key_parts, NTuple, Pool};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -21,6 +22,8 @@ const LOG_MAX_AGE: Duration = Duration::from_secs(6 * 3600);
 const SAVE_EVERY: Duration = Duration::from_secs(600);
 /// Chunk reports per worker that the status page averages over.
 const RECENT: usize = 20;
+/// Boards the coordinator keeps per restart-pool key.
+const POOL_CAP: usize = 100_000;
 
 /// Bytes per entry on the wire, roughly: a 1-3 byte index gap plus a bf16 value.
 const BYTES_PER_ENTRY: f64 = 3.5;
@@ -99,32 +102,46 @@ fn job_value(job: &str, key: &str) -> Option<f64> {
     job.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('=')?.trim().parse().ok())
 }
 
-/// Totals of the fresh games in one training chunk: reached counts are for 2048 .. 32768,
-/// `best` and `top` are the chunk's highest score and tile rank.
-#[derive(Clone, Copy, Default)]
+/// Totals of one training chunk. Score and `reached` (2048 .. 65536) are over the fresh
+/// games, `best` and `top` are the chunk's highest fresh score and tile rank, and
+/// `restarts[s]` counts the episodes restarted at stage s+1 (16384, 32768, 65536 boards)
+/// and how many of them built the next tile.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 struct Chunk {
     secs: f64,
     episodes: u64,
     fresh: u64,
     score: u64,
-    reached: [u64; 5],
+    reached: [u64; 6],
     best: u64,
     top: u8,
+    restarts: [[u64; 2]; 3],
 }
 
 impl Chunk {
     fn to_query(self) -> String {
         let r = self.reached.map(|x| x.to_string()).join(",");
-        format!("secs={:.1}&episodes={}&fresh={}&score={}&reached={r}&best={}&top={}", self.secs, self.episodes, self.fresh, self.score, self.best, self.top)
+        let mut q = format!("secs={:.1}&episodes={}&fresh={}&score={}&reached={r}&best={}&top={}", self.secs, self.episodes, self.fresh, self.score, self.best, self.top);
+        for (i, [n, p]) in self.restarts.iter().enumerate() {
+            q += &format!("&r{}={n},{p}", i + 1);
+        }
+        q
     }
 
     fn from_query(q: &HashMap<String, String>) -> Chunk {
         let num = |k: &str| q.get(k).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
-        let mut reached = [0; 5];
-        for (slot, v) in reached.iter_mut().zip(q.get("reached").map_or("", |s| s).split(',')) {
-            *slot = v.parse().unwrap_or(0);
+        let list = |k: &str, slots: &mut [u64]| {
+            for (slot, v) in slots.iter_mut().zip(q.get(k).map_or("", |s| s).split(',')) {
+                *slot = v.parse().unwrap_or(0);
+            }
+        };
+        let mut reached = [0; 6];
+        list("reached", &mut reached);
+        let mut restarts = [[0; 2]; 3];
+        for (i, r) in restarts.iter_mut().enumerate() {
+            list(&format!("r{}", i + 1), r);
         }
-        Chunk { secs: num("secs"), episodes: num("episodes") as u64, fresh: num("fresh") as u64, score: num("score") as u64, reached, best: num("best") as u64, top: num("top") as u8 }
+        Chunk { secs: num("secs"), episodes: num("episodes") as u64, fresh: num("fresh") as u64, score: num("score") as u64, reached, best: num("best") as u64, top: num("top") as u8, restarts }
     }
 
     fn add(&mut self, o: &Chunk) {
@@ -137,6 +154,10 @@ impl Chunk {
         }
         self.best = self.best.max(o.best);
         self.top = self.top.max(o.top);
+        for (a, b) in self.restarts.iter_mut().zip(o.restarts) {
+            a[0] += b[0];
+            a[1] += b[1];
+        }
     }
 
     fn rate(&self) -> f64 {
@@ -181,10 +202,18 @@ struct Coord {
     episodes: u64,
     /// Best training game so far: (score, tile rank, machine, unix time), kept in `path.best`.
     record: Option<(u64, u8, String, u64)>,
+    /// Restart boards harvested by every worker, kept in `path.pool`.
+    pool: Pool,
+    rng: Rng,
 }
 
 impl Coord {
     fn save(&mut self) {
+        if self.pool.dirty() {
+            if let Err(e) = self.pool.save(&format!("{}.pool", self.path)) {
+                eprintln!("saving the pool: {e}");
+            }
+        }
         if self.seq == self.saved_seq {
             return;
         }
@@ -208,24 +237,32 @@ impl Coord {
         eprintln!("saved master at seq {} in {:.1}s", self.seq, t.elapsed().as_secs_f64());
     }
 
+    /// Episodes played in the current stage (from `stage_start`) and the stage's goal.
+    fn progress(&self) -> (f64, f64) {
+        let since = (self.episodes as f64 - job_value(&self.job, "stage_start").unwrap_or(0.0)).max(0.0);
+        (since, job_value(&self.job, "goal").unwrap_or(100e6))
+    }
+
     /// The job as workers see it. With `schedule=otd`, alpha and TC follow the OTD recipe
     /// over the stage's `goal` episodes: per-weight alpha 0.1/64, cut 10x at 50% and again at
-    /// 75%.
+    /// 75%. `net_stages` is always the master's stage count, so a worker whose copy has a
+    /// different shape knows to download the master again.
     fn effective_job(&self) -> String {
-        if job_text(&self.job, "schedule") != Some("otd") {
-            return self.job.clone();
+        let mut out: String = self.job.lines().filter(|l| !l.starts_with("net_stages=")).map(|l| format!("{l}\n")).collect();
+        if job_text(&self.job, "schedule") == Some("otd") {
+            let (since, goal) = self.progress();
+            // No TC phase: its accumulators live on each worker, start at zero and reset on every
+            // restart, so each weight's first TC step is the full 1.0 rate. On 2026-09-27 that took
+            // the farm's mean score from 302k to 35k within an hour.
+            let (alpha, tc) = match since / goal {
+                d if d < 0.5 => (0.1, 0),
+                d if d < 0.75 => (0.01, 0),
+                _ => (0.001, 0),
+            };
+            out = out.lines().filter(|l| !l.starts_with("alpha=") && !l.starts_with("tc=")).map(|l| format!("{l}\n")).collect();
+            out += &format!("alpha={}\ntc={tc}\n", alpha / 64.0);
         }
-        let done = self.episodes as f64 / job_value(&self.job, "goal").unwrap_or(100e6);
-        // No TC phase: its accumulators live on each worker, start at zero and reset on every
-        // restart, so each weight's first TC step is the full 1.0 rate. On 2026-09-27 that took
-        // the farm's mean score from 302k to 35k within an hour.
-        let (alpha, tc) = match done {
-            d if d < 0.5 => (0.1, 0),
-            d if d < 0.75 => (0.01, 0),
-            _ => (0.001, 0),
-        };
-        let mut out: String = self.job.lines().filter(|l| !l.starts_with("alpha=") && !l.starts_with("tc=")).map(|l| format!("{l}\n")).collect();
-        out += &format!("alpha={}\ntc={tc}\n", alpha / 64.0);
+        out += &format!("net_stages={}\n", self.net.stages());
         out
     }
 
@@ -254,19 +291,22 @@ impl Coord {
         // Headline: progress towards the episode goal of this training stage.
         let live = |w: &WorkerInfo| w.last_seen.elapsed() < Duration::from_secs(600);
         let rate: f64 = self.workers.values().filter(|w| live(w)).map(recent_rate).sum();
-        let goal = job("goal").unwrap_or(100e6);
-        let done = (self.episodes as f64 / goal).min(1.0);
+        let (since, goal) = self.progress();
+        let done = (since / goal).min(1.0);
         let bar = (done * 30.0).round() as usize;
-        let eta = if rate > 0.0 { duration((goal - self.episodes as f64).max(0.0) / rate) } else { "-".into() };
+        let eta = if rate > 0.0 { duration((goal - since).max(0.0) / rate) } else { "-".into() };
         s += &paint("1", "2048 TRAINING FARM".into());
-        s += &format!("   alpha {}{}   TC {}{}\n",
+        s += &format!("   alpha {}{}   TC {}   stages {} (frozen below {}), restarts from stage {}{}\n",
             job("alpha").unwrap_or(0.0),
             if job_text(&self.job, "schedule") == Some("otd") { " (auto: OTD schedule)" } else { "" },
             if job("tc").unwrap_or(0.0) > 0.0 { "on" } else { "off" },
+            self.net.stages(),
+            job("freeze").unwrap_or(0.0),
+            job("restart_stage").unwrap_or(1.0),
             if job("pause").unwrap_or(0.0) > 0.0 { paint("33", "   PAUSED".into()) } else { String::new() });
-        s += &format!("progress  {}{}  {:.1}%  {} / {} games  ETA {eta}\n",
+        s += &format!("progress  {}{}  {:.1}%  {} / {} games this stage ({} in all)  ETA {eta}\n",
             paint("32", "#".repeat(bar)), paint("2", ".".repeat(30 - bar)), done * 100.0,
-            millions(self.episodes as f64), millions(goal));
+            millions(since), millions(goal), millions(self.episodes as f64));
         if let Some((score, rank, who, at)) = &self.record {
             let ago = duration(unix_now().saturating_sub(*at) as f64);
             s += &format!("best game {}  ({} tile)  by {who}, {ago} ago\n", paint("1;32", thousands(*score as f64)), 1u64 << rank);
@@ -311,15 +351,16 @@ impl Coord {
 
         // Training results, from each worker's recent chunks.
         s += "\n";
-        s += &paint("1", format!("{:<12}{:>9}{:>12}{:>8}{:>8}{:>8}{:>8}{:>8}{:>12}", "RESULTS", "games/s", "mean score", "2048", "4096", "8192", "16384", "32768", "best"));
+        s += &paint("1", format!("{:<12}{:>9}{:>12}{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}{:>12}", "RESULTS", "games/s", "mean score", "2048", "4096", "8192", "16384", "32768", "65536", "best"));
         s += "\n";
         let row = |label: &str, c: &Chunk, rate: f64| {
             let pct = |x: u64| if c.fresh == 0 { 0.0 } else { 100.0 * x as f64 / c.fresh as f64 };
             let r = c.reached;
             let mean = if c.fresh == 0 { 0.0 } else { c.score as f64 / c.fresh as f64 };
-            format!("{label:<12}{:>9}{:>12}{:>7.1}%{:>7.1}%{:>7.1}%{:>7.2}%{:>7.2}%{:>12}\n",
-                thousands(rate), thousands(mean), pct(r[0]), pct(r[1]), pct(r[2]), pct(r[3]), pct(r[4]), thousands(c.best as f64))
+            format!("{label:<12}{:>9}{:>12}{:>7.1}%{:>7.1}%{:>7.1}%{:>7.2}%{:>7.2}%{:>7.3}%{:>12}\n",
+                thousands(rate), thousands(mean), pct(r[0]), pct(r[1]), pct(r[2]), pct(r[3]), pct(r[4]), pct(r[5]), thousands(c.best as f64))
         };
+        let mut sums: Vec<(&String, Chunk, bool)> = Vec::new();
         let mut total = Chunk::default();
         for name in &names {
             let w = &self.workers[*name];
@@ -332,11 +373,43 @@ impl Coord {
             if live(w) {
                 total.add(&sum);
             }
+            sums.push((name, sum, live(w)));
         }
         s += &paint("1", row("ALL", &total, rate));
+
+        // Restart episodes: how often a game restarted at a stage built the stage's next tile.
+        if total.restarts.iter().any(|r| r[0] > 0) {
+            s += "\n";
+            s += &paint("1", format!("{:<12}{:>12}{:>10}{:>12}{:>10}{:>12}{:>10}", "RESTARTS", "from 16384", "-> 32768", "from 32768", "-> 65536", "from 65536", "-> next"));
+            s += "\n";
+            let rrow = |label: &str, c: &Chunk| {
+                let mut line = format!("{label:<12}");
+                for [n, p] in c.restarts {
+                    line += &if n == 0 { format!("{:>12}{:>10}", "-", "-") } else { format!("{:>12}{:>9.2}%", thousands(n as f64), 100.0 * p as f64 / n as f64) };
+                }
+                line + "\n"
+            };
+            for (name, sum, _) in &sums {
+                s += &rrow(name, sum);
+            }
+            s += &paint("1", rrow("ALL", &total));
+        }
+
+        // The restart pool, one line per chain state.
+        let summary = self.pool.summary();
+        if !summary.is_empty() {
+            s += "\n";
+            s += &paint("1", format!("{:<12}{:<10}{:<16}{:<10}{:>12}{:>12}", "POOL", "largest", "chain down to", "free top", "boards", "seen"));
+            s += "\n";
+            for (k, n, seen) in summary {
+                let (m, f, t) = key_parts(k);
+                let tile = |r: u8| if r == 0 { "-".to_string() } else { (1u64 << r).to_string() };
+                s += &format!("{:<12}{:<10}{:<16}{:<10}{:>12}{:>12}\n", "", tile(m), tile(f), tile(t), thousands(n as f64), thousands(seen as f64));
+            }
+        }
         s += &paint("2", format!(
-            "\nmaster: update {}, saved {} ago, {} updates held ({} MB). Scores and best are over each machine's last {RECENT} chunks.\n",
-            self.seq, duration(self.saved_at.elapsed().as_secs_f64()), self.log.len(), self.log_bytes >> 20));
+            "\nmaster: update {}, saved {} ago, {} updates held ({} MB), {} pool boards. Scores and best are over each machine's last {RECENT} chunks.\n",
+            self.seq, duration(self.saved_at.elapsed().as_secs_f64()), self.log.len(), self.log_bytes >> 20, thousands(self.pool.total() as f64)));
         s
     }
 }
@@ -412,6 +485,27 @@ fn share(workers: &HashMap<String, WorkerInfo>, name: &str) -> f32 {
 /// A delta times `scale`, rounded to what the wire carries so both ends agree exactly.
 fn scaled(delta: &[(u32, f32)], scale: f32) -> Vec<(u32, f32)> {
     delta.iter().map(|&(i, d)| (i, from_bf16(to_bf16(d * scale)))).filter(|e| e.1 != 0.0).collect()
+}
+
+/// Removes the entries below `start`, the first trainable weight under the job's freeze,
+/// and returns how many went. A finished stage cannot be written by any worker this way.
+fn drop_frozen(delta: &mut Vec<(u32, f32)>, start: usize) -> usize {
+    let before = delta.len();
+    delta.retain(|&(i, _)| i as usize >= start);
+    before - delta.len()
+}
+
+/// What a worker adds to its own net after the master took `taken` of what it `sent`
+/// (both sorted by index, `taken` a scaled and filtered subset): the difference, so the
+/// local copy holds exactly what the master holds and the rest returns to the residual.
+fn settle(sent: &[(u32, f32)], taken: &[(u32, f32)]) -> Vec<(u32, f32)> {
+    let mut back = Vec::with_capacity(sent.len());
+    let mut t = taken.iter().peekable();
+    for &(i, d) in sent {
+        let a = if t.peek().is_some_and(|x| x.0 == i) { t.next().unwrap().1 } else { 0.0 };
+        back.push((i, a - d));
+    }
+    back
 }
 
 fn parse_query(target: &str) -> (String, HashMap<String, String>) {
@@ -543,7 +637,13 @@ fn handle(mut stream: TcpStream, coord: &Mutex<Coord>, token: &str) -> std::io::
             // move those weights several times over. Each change is weighted by the worker's
             // share of games instead, which averages the machines' nets.
             let scale = share(&c.workers, &name);
-            let delta = scaled(&delta, scale);
+            let mut delta = scaled(&delta, scale);
+            // Frozen stages are final: nothing a worker sends for them is taken.
+            let frozen_end = (job_value(&c.job, "freeze").unwrap_or(0.0) as usize).min(c.net.stages()) * c.net.stage_size();
+            let dropped = drop_frozen(&mut delta, frozen_end);
+            if dropped > 0 {
+                eprintln!("{name}: dropped {dropped} changes to frozen weights");
+            }
             c.net.apply(&delta);
             c.seq += 1;
             let seq = c.seq;
@@ -551,7 +651,30 @@ fn handle(mut stream: TcpStream, coord: &Mutex<Coord>, token: &str) -> std::io::
             c.log_bytes += bytes.len();
             c.log.push_back(Delta { seq, from: me, bytes: Arc::new(bytes), at: Instant::now() });
             drop(c);
-            respond(&mut stream, 200, format!("{seq} {scale}").as_bytes());
+            respond(&mut stream, 200, format!("{seq} {scale} {frozen_end}").as_bytes());
+        }
+        ("POST", "/positions") => {
+            // A worker's harvest of restart boards since its last chunk.
+            let Some(entries) = Pool::decode(&body) else {
+                respond(&mut stream, 500, b"bad positions\n");
+                return Ok(());
+            };
+            let mut c = coord.lock().unwrap();
+            let c = &mut *c;
+            c.pool.merge(&entries, &mut c.rng);
+            respond(&mut stream, 200, b"ok\n");
+        }
+        ("GET", "/positions") => {
+            // A sample of the pool for a worker's restarts: `n` boards from keys at stage
+            // `min_stage` or above, keys drawn uniformly.
+            let n: usize = q.get("n").and_then(|s| s.parse().ok()).unwrap_or(4000).min(100_000);
+            let min_stage: usize = q.get("min_stage").and_then(|s| s.parse().ok()).unwrap_or(1);
+            let body = {
+                let mut guard = coord.lock().unwrap();
+                let c = &mut *guard;
+                Pool::encode(&c.pool.sample(n, min_stage, &mut c.rng))
+            };
+            respond(&mut stream, 200, &body);
         }
         ("POST", "/shutdown") => {
             // Save the net and the delta log, then exit; systemd starts the new binary, and
@@ -583,6 +706,8 @@ pub fn coord(net_path: String, token: String, port: u16) {
     });
     let (log, log_bytes) = load_log(&format!("{net_path}.log"), seq);
     eprintln!("restored {} deltas ({} MB) of the log", log.len(), log_bytes >> 20);
+    let pool = Pool::load(&format!("{net_path}.pool"), POOL_CAP);
+    eprintln!("restart pool: {} boards in {} chain states; master has {} stages", pool.total(), pool.summary().len(), net.stages());
     let coord = Arc::new(Mutex::new(Coord {
         net,
         path: net_path,
@@ -595,6 +720,8 @@ pub fn coord(net_path: String, token: String, port: u16) {
         workers: HashMap::new(),
         episodes,
         record,
+        pool,
+        rng: Rng(unix_now() | 1),
     }));
     let saver = coord.clone();
     std::thread::spawn(move || loop {
@@ -669,8 +796,33 @@ fn download_net(c: &Client) -> Result<(NTuple, u64), String> {
     Ok((net, u64::from_le_bytes(seq)))
 }
 
+/// A worker's copy of the master as it last knew it, from the first trainable weight on
+/// (frozen stages never change, so they are not kept twice). net - mirror is training not
+/// yet sent.
+struct Mirror {
+    start: usize,
+    w: Vec<f32>,
+}
+
+impl Mirror {
+    /// Taken right after a sync, when the net holds exactly what the master holds. The
+    /// net's freeze must already be the job's.
+    fn of(net: &NTuple) -> Mirror {
+        let start = net.frozen_end();
+        Mirror { start, w: net.snapshot_from(start) }
+    }
+
+    fn add(&mut self, delta: &[(u32, f32)]) {
+        for &(i, d) in delta {
+            if let Some(x) = (i as usize).checked_sub(self.start).and_then(|j| self.w.get_mut(j)) {
+                *x += d;
+            }
+        }
+    }
+}
+
 /// Applies every other worker's deltas since `since`; None means too far behind (re-download).
-fn pull(c: &Client, net: &NTuple, mirror: &mut [f32], since: u64, me: &str) -> Result<Option<u64>, String> {
+fn pull(c: &Client, net: &NTuple, mirror: &mut Mirror, since: u64, me: &str) -> Result<Option<u64>, String> {
     let (code, path) = c.call("GET", &format!("/deltas?since={since}&me={me}"), None)?;
     if code == 410 {
         return Ok(None);
@@ -688,18 +840,23 @@ fn pull(c: &Client, net: &NTuple, mirror: &mut [f32], since: u64, me: &str) -> R
         pos += 4;
         let delta = decode(bytes.get(pos..pos + len).ok_or_else(bad)?).ok_or_else(bad)?;
         net.apply(&delta);
-        add_into(mirror, &delta);
+        mirror.add(&delta);
         pos += len;
     }
     Ok(Some(seq))
 }
 
-fn add_into(v: &mut [f32], delta: &[(u32, f32)]) {
-    for &(i, d) in delta {
-        if let Some(x) = v.get_mut(i as usize) {
-            *x += d;
-        }
+/// Fetches a sample of the master's restart pool into `pool`.
+fn fetch_positions(c: &Client, pool: &Pool, n: usize, min_stage: usize, rng: &mut Rng) -> Result<usize, String> {
+    let (code, path) = c.call("GET", &format!("/positions?n={n}&min_stage={min_stage}"), None)?;
+    if code != 200 {
+        return Err(format!("GET /positions: HTTP {code}"));
     }
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let entries = Pool::decode(&bytes).ok_or("malformed positions response")?;
+    let got = entries.iter().map(|e| e.2.len()).sum();
+    pool.merge(&entries, rng);
+    Ok(got)
 }
 
 /// Machine load for the status page, as query pairs: cpu (%), temp (C), ram, ramtot and
@@ -831,7 +988,7 @@ fn machine_name() -> String {
 }
 
 /// Workers older than the job's `version=` restart into the new build on their own.
-const BUILD: u32 = 7;
+const BUILD: u32 = 8;
 pub const CHILD_ENV: &str = "G2048_WORKER_CHILD";
 /// The exit code a worker uses to ask its supervisor for the new build.
 const UPDATE_EXIT: i32 = 42;
@@ -901,6 +1058,7 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
     let c = Client { url: url.trim_end_matches('/').to_string(), auth: format!("Authorization: Bearer {token}"), tmp: cache.clone(), max_time: None };
     let cached = cache.join("net.bin");
     let cached_seq = cache.join("net.seq");
+    let pool_file = cache.join("pool.bin");
     eprintln!("worker {me} using {threads} threads");
     let status = Arc::new(Mutex::new("starting"));
     let cores = Arc::new(Mutex::new(threads));
@@ -912,21 +1070,24 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
     }
     let set = |s: &'static str| *status.lock().unwrap() = s;
 
-    // The local net, the master as this worker last knew it (`mirror`), and the master's seq.
-    // net - mirror is training not yet sent. While one chunk trains, a background thread
-    // sends the previous chunk's changes and pulls everyone else's, so no core sits idle.
+    // The local net, the master as this worker last knew it (`mirror`, taken once the job's
+    // freeze is known) and the master's seq. While one chunk trains, a background thread
+    // sends the previous chunk's changes and pulls everyone else's, so no core sits idle;
+    // the mirror travels with that thread and is None here meanwhile.
     let mut net: Option<Arc<NTuple>> = None;
-    let mut mirror: Vec<f32> = Vec::new();
+    let mut mirror: Option<Mirror> = None;
     let mut seq = 0;
     if let Some(n) = NTuple::load(cached.to_str().unwrap()).ok() {
         if let Some(s) = std::fs::read_to_string(&cached_seq).ok().and_then(|s| s.trim().parse().ok()) {
             eprintln!("resuming from the cached net at seq {s}");
-            mirror = n.snapshot();
             (net, seq) = (Some(Arc::new(n)), s);
         }
     }
-    let mut syncing: Option<std::thread::JoinHandle<(Vec<f32>, Option<u64>)>> = None;
-    let mut pool: Option<RestartPool> = None;
+    let mut syncing: Option<std::thread::JoinHandle<(Mirror, Option<u64>)>> = None;
+    // Restart boards: this machine's harvest plus samples of the master's pool, kept
+    // across restarts.
+    let pool = Arc::new(Pool::load(pool_file.to_str().unwrap(), 2000));
+    eprintln!("restart pool: {} boards", pool.total());
     let mut last_cache_save = Instant::now();
     let mut seed = nanos;
     #[cfg(windows)]
@@ -934,6 +1095,11 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
     let backoff = || {
         set("retrying");
         std::thread::sleep(Duration::from_secs(30));
+    };
+    let save_pool = |pool: &Pool| {
+        if let Err(e) = pool.save(pool_file.to_str().unwrap()) {
+            eprintln!("saving the pool: {e}");
+        }
     };
 
     loop {
@@ -957,6 +1123,7 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
                     }
                 }
             }
+            save_pool(&pool);
             std::process::exit(UPDATE_EXIT);
         }
         if job_value(&job, &format!("stop.{name}")).unwrap_or(0.0) > 0.0 {
@@ -965,6 +1132,7 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
             if let Some(h) = syncing.take() {
                 let _ = h.join();
             }
+            save_pool(&pool);
             std::process::exit(STOP_EXIT);
         }
         if job_value(&job, "pause").unwrap_or(0.0) > 0.0 {
@@ -972,6 +1140,7 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
             std::thread::sleep(Duration::from_secs(60));
             continue;
         }
+        let freeze = job_value(&job, "freeze").unwrap_or(0.0) as usize;
         // No net yet (or too far behind): download the master and catch up before training.
         if net.is_none() {
             set("downloading net");
@@ -986,9 +1155,10 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
                     continue;
                 }
             };
-            mirror = n.snapshot();
+            n.set_frozen(freeze);
+            let mut m = Mirror::of(&n);
             set("syncing");
-            match pull(&c, &n, &mut mirror, seq, &me) {
+            match pull(&c, &n, &mut m, seq, &me) {
                 Ok(Some(s)) => seq = s,
                 Ok(None) => continue,
                 Err(e) => {
@@ -998,18 +1168,39 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
                 }
             }
             net = Some(Arc::new(n));
+            mirror = Some(m);
         }
         let n = net.clone().unwrap();
-        // A re-downloaded master can have more stages than the net the pool was made for.
-        if pool.as_ref().is_some_and(|p| p.sizes().len() != n.stages()) {
-            pool = None;
+        n.set_frozen(freeze);
+        // The master grew a stage (or this copy is from another net): deltas for the new
+        // stage would be dropped here unnoticed, so download the master again.
+        if job_value(&job, "net_stages").is_some_and(|k| k as usize != n.stages()) {
+            eprintln!("the master has {} stages, this copy {}; downloading it again", job_value(&job, "net_stages").unwrap_or(0.0), n.stages());
+            if let Some(h) = syncing.take() {
+                let _ = h.join();
+            }
+            (net, mirror) = (None, None);
+            continue;
         }
-        let pool = pool.get_or_insert_with(|| RestartPool::new(n.stages(), 100_000));
+        if syncing.is_none() {
+            match &mirror {
+                // Resumed from the cache: the cached net is the master as last known.
+                None => mirror = Some(Mirror::of(&n)),
+                Some(m) if m.start != n.frozen_end() => {
+                    eprintln!("freeze changed; downloading the master again");
+                    (net, mirror) = (None, None);
+                    continue;
+                }
+                _ => {}
+            }
+        }
 
         // Train one chunk. `freeze=N` keeps stages below N fixed while later stages learn.
-        n.set_frozen(job_value(&job, "freeze").unwrap_or(0.0) as usize);
         let alpha = job_value(&job, "alpha").unwrap_or(0.00015625) as f32;
         let restart = job_value(&job, "restart").unwrap_or(0.5) as f32;
+        let restart_stage = job_value(&job, "restart_stage").unwrap_or(1.0) as usize;
+        let pool_n = job_value(&job, "pool_n").unwrap_or(4000.0) as usize;
+        pool.set_cap(job_value(&job, "pool_cap").unwrap_or(2000.0) as usize);
         let secs = job_value(&job, "secs").unwrap_or(120.0);
         let send_mb = job_value(&job, "send_mb").unwrap_or(16.0);
         // `priority.NAME=high` etc. sets a Windows machine's priority class. Below normal (the
@@ -1030,43 +1221,66 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
         // `threads.NAME=N` in the job caps one machine's cores.
         let threads = job_value(&job, &format!("threads.{name}")).map_or(threads, |t| (t as usize).clamp(1, threads));
         *cores.lock().unwrap() = threads;
-        let counters: Vec<AtomicU64> = (0..10).map(|_| AtomicU64::new(0)).collect();
+        // [episodes, fresh, score, reached 2048..65536 (6), best, top, restarts from stage 1..3 as (count, progressed)]
+        let counters: Vec<AtomicU64> = (0..17).map(|_| AtomicU64::new(0)).collect();
         let start = Instant::now();
         set("training");
         seed = seed.wrapping_add(0x9E37_79B9);
-        ntuple::train_parallel(&n, pool, alpha, restart, seed, threads, u64::MAX, Some(start + Duration::from_secs_f64(secs)), &|_, e| {
+        ntuple::train_parallel(&n, &pool, alpha, restart, restart_stage, seed, threads, u64::MAX, Some(start + Duration::from_secs_f64(secs)), &|_, e| {
             counters[0].fetch_add(1, Relaxed);
             if e.fresh {
                 counters[1].fetch_add(1, Relaxed);
                 counters[2].fetch_add(e.score, Relaxed);
-                for k in 0..5 {
+                for k in 0..6 {
                     if e.max_rank >= 11 + k as u8 {
                         counters[3 + k].fetch_add(1, Relaxed);
                     }
                 }
-                counters[8].fetch_max(e.score, Relaxed);
-                counters[9].fetch_max(e.max_rank as u64, Relaxed);
+                counters[9].fetch_max(e.score, Relaxed);
+                counters[10].fetch_max(e.max_rank as u64, Relaxed);
+            } else {
+                let s = (e.start_rank as usize).saturating_sub(13).clamp(1, 3);
+                counters[11 + 2 * (s - 1)].fetch_add(1, Relaxed);
+                counters[12 + 2 * (s - 1)].fetch_add(e.progressed() as u64, Relaxed);
             }
         });
         let v: Vec<u64> = counters.iter().map(|a| a.load(Relaxed)).collect();
-        let chunk = Chunk { secs: start.elapsed().as_secs_f64(), episodes: v[0], fresh: v[1], score: v[2], reached: [v[3], v[4], v[5], v[6], v[7]], best: v[8], top: v[9] as u8 };
+        let chunk = Chunk {
+            secs: start.elapsed().as_secs_f64(),
+            episodes: v[0],
+            fresh: v[1],
+            score: v[2],
+            reached: [v[3], v[4], v[5], v[6], v[7], v[8]],
+            best: v[9],
+            top: v[10] as u8,
+            restarts: [[v[11], v[12]], [v[13], v[14]], [v[15], v[16]]],
+        };
+        let harvest = pool.take_outbox();
         drop(n);
 
         // The previous chunk's sync must land before this chunk's changes are measured.
         if let Some(h) = syncing.take() {
             set("syncing");
             let (m, s) = h.join().expect("sync thread panicked");
-            mirror = m;
+            mirror = Some(m);
             match s {
                 Some(s) => seq = s,
                 None => {
                     eprintln!("too far behind the master, downloading it again");
-                    net = None;
+                    (net, mirror) = (None, None);
                     continue;
                 }
             }
         }
         let n = net.as_mut().unwrap();
+        let m = mirror.take().expect("mirror present after sync");
+        if m.start != n.frozen_end() {
+            // The job's freeze moved while this chunk trained; this chunk's changes are not
+            // worth sending against a copy whose trainable range no longer matches.
+            eprintln!("freeze changed; downloading the master again");
+            (net, mirror) = (None, None);
+            continue;
+        }
         // TC fine-tuning phase: its per-weight accumulators stay local to each worker.
         if job_value(&job, "tc").unwrap_or(0.0) > 0.0 && !n.tc_enabled() {
             eprintln!("switching to TC learning");
@@ -1076,17 +1290,23 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
             if n.save(cached.to_str().unwrap()).is_ok() {
                 let _ = std::fs::write(&cached_seq, seq.to_string());
             }
+            save_pool(&pool);
             last_cache_save = Instant::now();
         }
         set("preparing update");
-        let unsent = n.diff(&mirror);
+        let unsent = n.diff_from(&m.w, m.start);
         let pending = unsent.len();
         let sent = pick_largest(unsent, send_mb * 1e6);
         let bytes = encode(&sent);
         let file = cache.join("delta.bin");
         std::fs::write(&file, &bytes).expect("writing delta");
+        let positions = cache.join("positions.bin");
+        let harvested: usize = harvest.iter().map(|e| e.2.len()).sum();
+        if harvested > 0 {
+            std::fs::write(&positions, Pool::encode(&harvest)).expect("writing positions");
+        }
 
-        let (c, n, me, name, mut mirror_owned) = (c.clone(), n.clone(), me.clone(), name.clone(), std::mem::take(&mut mirror));
+        let (c, n, me, name, pool, mut m) = (c.clone(), n.clone(), me.clone(), name.clone(), pool.clone(), m);
         syncing = Some(std::thread::spawn(move || {
             // Keep retrying: dropping a delta would leave this copy ahead of the master for good.
             let reply = loop {
@@ -1098,19 +1318,17 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
                     }
                 }
             };
-            // The master took `scale` of what was sent; keep the same here so this copy matches it.
-            let scale: f32 = reply.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(1.0);
-            let taken = scaled(&sent, scale);
-            let mut back = Vec::with_capacity(sent.len());
-            let mut t = taken.iter().peekable();
-            for &(i, d) in &sent {
-                let a = if t.peek().is_some_and(|x| x.0 == i) { t.next().unwrap().1 } else { 0.0 };
-                back.push((i, a - d));
-            }
-            n.apply(&back);
-            add_into(&mut mirror_owned, &taken);
+            // The master took `scale` of what was sent and nothing in its frozen range; keep
+            // the same here so this copy matches it.
+            let mut words = reply.split_whitespace().skip(1);
+            let scale: f32 = words.next().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+            let frozen_end: usize = words.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let mut taken = scaled(&sent, scale);
+            drop_frozen(&mut taken, frozen_end);
+            n.apply(&settle(&sent, &taken));
+            m.add(&taken);
             eprintln!(
-                "{} games in {:.0}s, mean score {:.0}; sent {:.1} MB ({} of {} changed weights), share {scale:.2}",
+                "{} games in {:.0}s, mean score {:.0}; sent {:.1} MB ({} of {} changed weights), share {scale:.2}, {harvested} boards harvested",
                 chunk.episodes,
                 chunk.secs,
                 if chunk.fresh > 0 { chunk.score as f64 / chunk.fresh as f64 } else { 0.0 },
@@ -1118,8 +1336,14 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
                 sent.len(),
                 pending
             );
+            // The harvest is a sample; losing one is fine, so no retry loop.
+            if harvested > 0 {
+                if let Err(e) = c.text("POST", &format!("/positions?me={me}"), Some(&positions)) {
+                    eprintln!("{e}");
+                }
+            }
             let s = loop {
-                match pull(&c, &n, &mut mirror_owned, seq, &me) {
+                match pull(&c, &n, &mut m, seq, &me) {
                     Ok(s) => break s,
                     Err(e) => {
                         eprintln!("{e}; retrying in 30s");
@@ -1127,7 +1351,12 @@ pub fn worker(url: String, token: String, name: Option<String>, threads: usize, 
                     }
                 }
             };
-            (mirror_owned, s)
+            let mut rng = Rng(seq.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ nanos | 1);
+            match fetch_positions(&c, &pool, pool_n, restart_stage, &mut rng) {
+                Ok(got) => eprintln!("pool: {got} boards fetched, {} held", pool.total()),
+                Err(e) => eprintln!("{e}"),
+            }
+            (m, s)
         }));
     }
 }
@@ -1141,6 +1370,41 @@ mod tests {
         let d = vec![(0, 1.5), (5, -2.0), (300, 0.25), (400_000_000, 7.0)];
         assert_eq!(decode(&encode(&d)).unwrap(), d);
         assert_eq!(decode(&encode(&[])).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn chunk_query_roundtrip_and_old_workers() {
+        let c = Chunk { secs: 12.5, episodes: 100, fresh: 60, score: 9000, reached: [50, 40, 30, 20, 3, 1], best: 700, top: 15, restarts: [[30, 4], [10, 1], [0, 0]] };
+        let q = format!("/delta?me=x&{}", c.to_query());
+        assert_eq!(Chunk::from_query(&parse_query(&q).1), c);
+        // A build-7 worker sends five reached counts and no restart fields.
+        let old = parse_query("/delta?secs=1.0&episodes=5&fresh=5&score=10&reached=1,2,3,4,5&best=9&top=13").1;
+        let c = Chunk::from_query(&old);
+        assert_eq!((c.reached, c.restarts), ([1, 2, 3, 4, 5, 0], [[0, 0]; 3]));
+    }
+
+    #[test]
+    fn frozen_weights_are_dropped_and_settled() {
+        let sent = vec![(1, 0.5), (10, -2.0), (20, 4.0)];
+        let mut taken = scaled(&sent, 0.5);
+        assert_eq!(drop_frozen(&mut taken, 10), 1);
+        assert_eq!(taken, vec![(10, -1.0), (20, 2.0)]);
+        // The worker takes back what the master did not: all of index 1, half of the rest.
+        assert_eq!(settle(&sent, &taken), vec![(1, -0.5), (10, 1.0), (20, -2.0)]);
+        assert_eq!(drop_frozen(&mut taken, 0), 0);
+    }
+
+    #[test]
+    fn mirror_tracks_only_trainable_weights() {
+        let mut net = NTuple::new(0.0, 1, &ntuple::TUPLES_4);
+        net.expand_stages(2);
+        net.set_frozen(1);
+        let mut m = Mirror::of(&net);
+        assert_eq!((m.start, m.w.len()), (net.stage_size(), net.stage_size()));
+        m.add(&[(3, 1.0), (net.stage_size() as u32 + 3, 2.0)]);
+        assert_eq!(m.w[3], 2.0);
+        net.apply(&[(net.stage_size() as u32 + 3, 2.0)]);
+        assert!(net.diff_from(&m.w, m.start).is_empty());
     }
 
     #[test]

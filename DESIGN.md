@@ -37,6 +37,51 @@ computes it today):
 7. `BUILD` 7 -> 8, two new endpoints (`/positions` GET and POST), eight new job keys, the
    coordinator enforces `freeze` on incoming deltas.
 
+## Release plan (from the review of 2026-09-29)
+
+Two releases, so stage 3 can start as soon as stage 2 finishes without waiting for the
+engine rewrite.
+
+**Release A, `BUILD` 8, on the current u64 board.** Everything stage 3 needs:
+
+- the restart-pool pipeline (section 5): harvest keys, `POST`/`GET /positions`, the
+  persisted global pool, local pool files, `restart_stage`, `pool_n`, `pool_cap`;
+- stage index from the raw board (4.1), `g2048 stages FILE N`, `stage_start` (4.4);
+- coordinator-side `freeze` enforcement and `net_stages` (section 7);
+- the mirror restricted to trainable stages (4.2), which is what keeps a 3-stage worker
+  at today's memory;
+- chunk statistics for restart outcomes and a 65536 column (5.4). On the u64 board a
+  training episode ends when two 32768s merge: the board cannot hold the result, so the
+  episode is scored as "reached 65536" and the last transition is not learned.
+
+Not in A: search in training (section 6), the `harvest` command, chain-upgrade
+augmentation. They need 65536 boards to be useful, so they ride with B.
+
+**Release B, `BUILD` 9, before stage 4.** The u128 board (section 3) and everything that
+depends on it: `abstract()` downgrading twice, rank 17 as the win, the one-char-per-cell
+position format, the 131072 row in reports, and the search options. Gate: games/s on a
+tiny run before and after must not drop more than 15% end to end.
+
+**Review decisions recorded:** u128 approved subject to that gate; downgrading over
+anchor canonicalisation; no TC in any form for now.
+
+**Release A status (2026-09-29): implemented on `stage3`, `BUILD` 8.** `cargo test
+--release` passes (17 tests). A tiny run with a 4-tuple 3-stage net, one coordinator and
+one worker on localhost, `freeze=1 restart=0.6 secs=6`, showed: the job carrying
+`net_stages=3`, OTD progress counted from `stage_start`, restarts from 16384 and 32768
+boards in the RESTARTS table, 9 chain states in the POOL block, 576 boards uploaded per
+chunk and 100 fetched back, a delta aimed at stage 0 dropped by the coordinator, and
+both pool files written. Worker RSS was 1.3 GB for a 768 MB net: net plus a mirror of
+the two trainable stages, so the mirror restriction works as intended (1.5 GB without
+it). A build-7 worker's chunk report still parses.
+
+**Memory, from measured numbers.** A worker uses 2.1 GB today at 2 stages: 1 GB net,
+1 GB mirror, the rest tables and buffers. Naively that is 3.1 GB at 3 stages and 4.1 GB
+at 4. With the mirror covering only trainable stages (one stage at a time under the
+stage schedule), the expectation is 2.1 GB at 3 stages and 2.6 GB at 4. The status page's
+RAM column will show whether the 3-stage rollout lands at 2.1 GB or 3.1 GB; if it is the
+latter, the mirror restriction is not working and stage 4 needs the 4 GB plan.
+
 ## 1. Where we are and how far 131072 is
 
 Current farm result: mean 387k, 32768 in about 26% of fresh games, 1-ply greedy.
@@ -325,6 +370,16 @@ use the result as a stage-4 start. It produces plausible but not observed 65536 
 it bootstraps stage 4 instantly; not recommended until real harvested boards are compared
 against it.
 
+### 5.5a Worker rules that fell out of the implementation
+
+- A worker's mirror starts at the first trainable weight. If the job's `freeze` changes,
+  the worker downloads the master again rather than patching the mirror (the chunk in
+  flight is lost on that worker; `freeze` changes once per stage).
+- The coordinator's reply to a delta now carries the frozen range end, and the worker
+  settles its local net with exactly what the master took: `scale` times the sent
+  changes, minus anything in the frozen range.
+- Uploading a harvest is one attempt without retries; losing a sample is harmless.
+
 ### 5.6 Bootstrapping stage 3 itself
 
 The build-7 workers hold their stage 2 pools in memory only and lose them when they exit
@@ -374,6 +429,9 @@ entries. `GET /net`, `/deltas`, `/job`, `/beat`, `/status`, `/shutdown` are unch
 | `search_p` | 0 | fraction of eligible restart episodes that search |
 | `upgrade_p` | 0 | fraction of stage-4 restarts synthesised by chain upgrade |
 
+`restart_stage`, `pool_n`, `pool_cap` and `stage_start` ship in Release A; the search
+keys and `upgrade_p` in Release B.
+
 Two safety nets on the coordinator, both cheap:
 
 - The effective job carries `net_stages=N`, generated from the master, never set by the
@@ -385,7 +443,7 @@ Two safety nets on the coordinator, both cheap:
   can log it. `freeze` is a worker-side rule today; enforcing it at the master means a
   misconfigured or outdated worker cannot write into a finished stage.
 
-`BUILD` goes from 7 to 8. Workers on build 7 keep working against a build-8 coordinator
+`BUILD` goes from 7 to 8 with Release A and to 9 with Release B. Workers on build 7 keep working against a build-8 coordinator
 until `farm set version=8`: they never call `/positions`, and the extra query fields are
 ignored by the old parser. They do compute the stage from the downgraded board, so they
 would keep training stage 1's weights on 32768 boards; the rollout below pauses them
@@ -397,7 +455,7 @@ first.
 
 Stage 3 start, once stage 2 hits its goal:
 
-1. `farm pause`. Build and publish the build-8 binaries (Linux and the Windows exe).
+1. `farm pause`. Build and publish the Release A binaries (Linux and the Windows exe).
 2. `POST /shutdown` saves the master and the delta log, then `systemctl stop` the unit
    so nothing races the next step (the log restore only applies if the saved net is the
    one the log ends at; expanding stages keeps the existing indices, so it still does).
@@ -411,9 +469,9 @@ Stage 3 start, once stage 2 hits its goal:
    and trains.
 6. Watch the status page's POOL block and the `r2` restart outcome column.
 
-Stage 4 start: same sequence with `g2048 stages nets/otd.bin 4`, `freeze=3`, `restart_stage=3`,
-plus `search_p=0.02 search=1` for a while so the 65536 buckets fill, and the offline
-`harvest` on the server if they fill too slowly.
+Stage 4 start (Release B, `version=9`): same sequence with `g2048 stages nets/otd.bin 4`,
+`freeze=3`, `restart_stage=3`, plus `search_p=0.02 search=1` for a while so the 65536
+buckets fill, and the offline `harvest` on the server if they fill too slowly.
 
 ## 9. Testing plan
 
@@ -452,10 +510,9 @@ Tiny runs (not in `cargo test`, run by hand and in a `farm/tiny.sh`):
 
 ## 10. Risks and questions for review
 
-1. **u128 board.** Largest blast radius in the plan and unavoidable for 65536. Is a 2x
-   engine slowdown acceptable if the end-to-end training rate drops by, say, 5%? The
-   alternative of keeping u64 with a 65536 mask has the same table size and worse
-   code; I do not recommend it.
+1. **u128 board.** Largest blast radius in the plan and unavoidable for 65536. Approved
+   for Release B with the 15% end-to-end gate; the alternative of keeping u64 with a
+   65536 mask has the same table size and worse code.
 2. **Stage index from the raw board.** This changes which weights 32768 boards use the
    moment the 3-stage net is loaded. It is exactly the intended stage 3 switch, but it
    must not be deployed while stage 2 is still meant to be learning 32768 play. The
@@ -473,9 +530,10 @@ Tiny runs (not in `cargo test`, run by hand and in a `farm/tiny.sh`):
    competes with throughput. Defaults are off.
 6. **Chain-upgrade augmentation.** Fast bootstrap for stage 4 but synthetic. Off by
    default; needs an A/B against harvested boards before use.
-7. **Memory.** 4 stages is 2 GB of net per worker plus 512 MB mirror plus the 16 MB
-   tables. Machines under 4 GB free should get `stop.NAME=1` at the stage 4 start.
-8. **Coordinator-side TC.** Designed in 4.4, not planned. Say if you want it built.
+7. **Memory.** See the release plan: 2.1 GB expected at 3 stages, 2.6 GB at 4, to be
+   confirmed on the status page at the stage 3 rollout. Machines that cannot spare the
+   measured figure get `stop.NAME=1` at the stage 4 start.
+8. **Coordinator-side TC.** Designed in 4.4; review decision: not built.
 
 ## 11. Later, out of scope for this branch
 

@@ -23,6 +23,7 @@ without undo. Milestones on the way, with the records to beat:
 - [x] OTD stage 1: Matsuzaki 8x6-tuple net, 100M games (finished 2026-09-28; the TC phase
       broke it, so stage 1 is the pre-TC net, see below)
 - [ ] OTD stage 2: net for boards that already hold 16384 (running)
+- [ ] OTD stage 3: net for boards that already hold 32768 (farm build 8 ready, see `DESIGN.md`)
 - [ ] Deep search test (6-ply with tile downgrading)
 - [ ] Browser bot that plays play2048.co
 
@@ -33,6 +34,7 @@ cargo run --release -- train nets/main.bin 3000000 --tuples 8  # self-play TD tr
 cargo run --release -- bench 16 --net nets/main.bin --depth 2   # expectimax on top of the net
 cargo run --release -- bench 16                                 # hand-heuristic expectimax
 cargo run --release -- serve --net nets/main.bin --depth 3      # move server for the browser bot (127.0.0.1:20480)
+cargo run --release -- stages nets/otd.bin 3                    # grow a saved net to 3 stages (new ones copy the last)
 ```
 `bench` plays games in parallel and prints mean/median score and how often each tile was reached.
 Weights live in `nets/` (gitignored; 512 MB for the 8-tuple net).
@@ -55,10 +57,23 @@ g2048 worker --url https://HOST/g2048 --token-file TOKEN_FILE       # each machi
   is left out on purpose: TC accumulators live on each worker, start at zero and reset on
   every restart, so each weight's first TC step runs at the full rate. When stage 1 hit
   90% on 2026-09-27 that took the farm's mean score from 302k to 35k within an hour.
-- **Stages:** `freeze=N` keeps stages below N fixed. Stage 2 runs with `freeze=1
-  restart=0.9`: 90% of games start from a saved board where 16384 first appeared and only
-  the stage-2 weights learn; the other 10% are fresh games that keep the pool of starting
-  boards varied.
+- **Stages:** a board's stage is its largest tile (below 16384 / 16384 / 32768 / 65536),
+  each with its own weights; inside a stage the pattern is looked up one step down
+  (`downgrade`), so a 32768 board reads as the familiar 16384 board. `freeze=N` keeps
+  stages below N fixed, and the coordinator drops anything a worker sends for a frozen
+  stage. Stage 2 runs with `freeze=1 restart=0.9`: 90% of games start from a saved
+  endgame board and only the stage-2 weights learn; the other 10% are fresh games.
+  `g2048 stages FILE N` grows the master before a new stage starts; workers notice the
+  new stage count (`net_stages` in the job) and download the net again.
+- **Restart pool:** every board holding 16384 or more is filed by chain state (largest
+  tile, how far the chain runs down unbroken, largest free tile) the first time a game
+  reaches that state. Workers send their harvest with each chunk, the coordinator keeps
+  a sample per state in `MASTER.pool`, and workers fetch `pool_n` boards back every sync
+  and keep `pool_cap` per state on disk. Restarts draw a state uniformly among those at
+  stage `restart_stage` or above, then a board, so rare deep states get as many restarts
+  as common ones. The status page lists the pool and how often restarts from each
+  stage built the next tile. `stage_start=<episodes>` tells the OTD schedule where the
+  current stage began.
 - **Auto-update:** a worker runs under a small supervisor. Bump `const BUILD` in
   `src/dist.rs`, publish the new binaries, then `farm set version=N`; every worker saves
   its net, updates (Windows downloads the new exe) and restarts on its own.

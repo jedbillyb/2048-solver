@@ -16,7 +16,8 @@ const USAGE: &str = "usage:
   g2048 serve --net FILE [--depth N] [--port 20480]
   g2048 coord --net MASTER --token-file F [--port 20490]      (hands out training work)
   g2048 worker --url URL --token-file F [--name N] [--threads N] [--cache DIR]
-  g2048 train OUT_FILE [games=1000000] [--resume FILE] [--alpha A] [--seed S] [--tc 1] [--stages 3] [--restart 0.5] [--tuples 4|8] [--init 320000]";
+  g2048 stages FILE [N]                                        (show, or grow to N stages, a saved net)
+  g2048 train OUT_FILE [games=1000000] [--resume FILE] [--alpha A] [--seed S] [--tc 1] [--stages 3] [--restart 0.5] [--restart-stage 1] [--tuples 4|8] [--init 320000]";
 
 struct GameResult {
     score: u64,
@@ -245,7 +246,8 @@ fn train(args: &[String]) {
     };
     net.expand_stages(flag(args, "--stages").unwrap_or(1));
     let restart_p: f32 = flag(args, "--restart").unwrap_or(0.0);
-    let pool = ntuple::RestartPool::new(net.stages(), 100_000);
+    let restart_stage: usize = flag(args, "--restart-stage").unwrap_or(1);
+    let pool = ntuple::Pool::new(100_000);
     if flag::<u8>(args, "--tc") == Some(1) {
         net.enable_tc();
     }
@@ -253,16 +255,18 @@ fn train(args: &[String]) {
     let alpha = alpha_flag.unwrap_or(0.1 / (8 * net.tuple_count()) as f32);
     const WINDOW: u64 = 10_000;
     let windows_done = AtomicU64::new(0);
-    // Per-window tallies: [score sum, games, >=2048, >=4096, >=8192, >=16384]
-    let stats: Vec<AtomicU64> = (0..6).map(|_| AtomicU64::new(0)).collect();
+    // Per-window tallies: [score sum, games, >=2048, >=4096, >=8192, >=16384, >=32768, restarts, restarts that progressed]
+    let stats: Vec<AtomicU64> = (0..9).map(|_| AtomicU64::new(0)).collect();
     let start = Instant::now();
-    ntuple::train_parallel(&net, &pool, alpha, restart_p, seed, threads(games), games, None, &|g, e| {
+    ntuple::train_parallel(&net, &pool, alpha, restart_p, restart_stage, seed, threads(games), games, None, &|g, e| {
         // Only fresh games say how strong the net is; restarts begin mid-game.
         if !e.fresh {
+            stats[7].fetch_add(1, Ordering::Relaxed);
+            stats[8].fetch_add(e.progressed() as u64, Ordering::Relaxed);
             return;
         }
         stats[0].fetch_add(e.score, Ordering::Relaxed);
-        for (i, k) in [11u8, 12, 13, 14].iter().enumerate() {
+        for (i, k) in [11u8, 12, 13, 14, 15].iter().enumerate() {
             if e.max_rank >= *k {
                 stats[2 + i].fetch_add(1, Ordering::Relaxed);
             }
@@ -271,8 +275,8 @@ fn train(args: &[String]) {
             let v: Vec<u64> = stats.iter().map(|s| s.swap(0, Ordering::Relaxed)).collect();
             let pct = |x: u64| 100.0 * x as f64 / v[1] as f64;
             println!(
-                "{:>9} games {:>6.0}s  mean {:>7.0}  2048 {:>5.1}%  4096 {:>5.1}%  8192 {:>5.1}%  16384 {:>4.1}%  pool {:?}",
-                g + 1, start.elapsed().as_secs_f64(), v[0] as f64 / v[1] as f64, pct(v[2]), pct(v[3]), pct(v[4]), pct(v[5]), pool.sizes()
+                "{:>9} games {:>6.0}s  mean {:>7.0}  2048 {:>5.1}%  4096 {:>5.1}%  8192 {:>5.1}%  16384 {:>4.1}%  32768 {:>4.2}%  restarts {} ({} progressed)  pool {}",
+                g + 1, start.elapsed().as_secs_f64(), v[0] as f64 / v[1] as f64, pct(v[2]), pct(v[3]), pct(v[4]), pct(v[5]), pct(v[6]), v[7], v[8], pool.total()
             );
             if windows_done.fetch_add(1, Ordering::Relaxed) % 10 == 9 {
                 net.save(&out).expect("saving weights");
@@ -281,6 +285,25 @@ fn train(args: &[String]) {
     });
     net.save(&out).expect("saving weights");
     println!("saved {out}");
+}
+
+/// `g2048 stages FILE [N]`: reports a saved net's shape, and with N grows it to N stages,
+/// each new stage a copy of the last (run on the server, coordinator stopped).
+fn stages(args: &[String]) {
+    let pos = positional(args);
+    let file = pos.first().unwrap_or_else(|| panic!("{USAGE}")).to_string();
+    let mut net = NTuple::load(&file).unwrap_or_else(|e| panic!("loading {file}: {e}"));
+    println!("{file}: {} stages, {} tuples, {} MB", net.stages(), net.tuple_count(), net.stages() * net.stage_size() * 4 >> 20);
+    if let Some(n) = pos.get(1).and_then(|s| s.parse::<usize>().ok()) {
+        if n <= net.stages() {
+            println!("already has {} stages, nothing to do", net.stages());
+            return;
+        }
+        let from = net.stages() - 1;
+        net.expand_stages(n);
+        net.save(&file).expect("saving weights");
+        println!("grown to {n} stages (the new ones copied from stage {from}), saved");
+    }
 }
 
 /// Board from 16 hex digits, one tile rank per cell, row-major from the top-left.
@@ -351,6 +374,7 @@ fn main() {
         Some("serve") => serve(&args[1..]),
         Some("positions") => positions(&args[1..]),
         Some("endgame") => endgame(&args[1..]),
+        Some("stages") => stages(&args[1..]),
         Some("coord") => {
             let a = &args[1..];
             dist::coord(flag(a, "--net").unwrap_or_else(|| panic!("{USAGE}")), token(a), flag(a, "--port").unwrap_or(20490))

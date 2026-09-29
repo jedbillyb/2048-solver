@@ -4,7 +4,7 @@
 #   farm.sh status            the same, once
 #   farm.sh dell              command for an admin PowerShell: installs a Windows worker as a boot task
 #   farm.sh job               current settings
-#   farm.sh set k=v [k=v..]   change settings (alpha, restart, secs, send_mb, pause)
+#   farm.sh set k=v [k=v..]   change settings (alpha, restart, restart_stage, freeze, secs, send_mb, pool_n, pool_cap, stage_start, pause)
 #   farm.sh pause | resume    stop / restart training on every machine
 #   farm.sh limit NAME N      run machine NAME on N threads (from its next round)
 #   farm.sh full NAME         back to every thread on NAME
