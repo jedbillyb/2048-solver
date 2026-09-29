@@ -505,13 +505,15 @@ impl Pool {
         if take(4)? != POOL_MAGIC || take(1)? != [8] {
             return None;
         }
+        // Counts come off the wire: never reserve more than the bytes could hold (a key
+        // entry is at least 14 bytes, a board 8), so a corrupt body cannot abort the process.
         let nkeys = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
-        let mut out = Vec::with_capacity(nkeys);
+        let mut out = Vec::with_capacity(nkeys.min(bytes.len() / 14));
         for _ in 0..nkeys {
             let key = u16::from_le_bytes(take(2)?.try_into().ok()?);
             let seen = u64::from_le_bytes(take(8)?.try_into().ok()?);
             let n = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
-            let mut boards = Vec::with_capacity(n.min(1 << 20));
+            let mut boards = Vec::with_capacity(n.min(bytes.len() / 8));
             for _ in 0..n {
                 boards.push(u64::from_le_bytes(take(8)?.try_into().ok()?));
             }
@@ -782,6 +784,14 @@ mod tests {
         // Wire round trip and file round trip.
         assert_eq!(Pool::decode(&Pool::encode(&out)).unwrap(), out);
         assert_eq!(Pool::decode(b"nope"), None);
+        // A header claiming billions of keys or boards must fail, not reserve memory.
+        let mut huge = b"POL1\x08".to_vec();
+        huge.extend(u32::MAX.to_le_bytes());
+        assert_eq!(Pool::decode(&huge), None);
+        let mut huge = b"POL1\x08\x01\0\0\0".to_vec();
+        huge.extend([0u8; 10]);
+        huge.extend(u32::MAX.to_le_bytes());
+        assert_eq!(Pool::decode(&huge), None);
         let path = std::env::temp_dir().join(format!("g2048-pool-test-{}.bin", std::process::id()));
         pool.save(path.to_str().unwrap()).unwrap();
         let loaded = Pool::load(path.to_str().unwrap(), 5);

@@ -517,6 +517,7 @@ fn parse_query(target: &str) -> (String, HashMap<String, String>) {
 fn respond(stream: &mut TcpStream, code: u16, body: &[u8]) {
     let reason = match code {
         200 => "OK",
+        400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
         410 => "Gone",
@@ -656,7 +657,7 @@ fn handle(mut stream: TcpStream, coord: &Mutex<Coord>, token: &str) -> std::io::
         ("POST", "/positions") => {
             // A worker's harvest of restart boards since its last chunk.
             let Some(entries) = Pool::decode(&body) else {
-                respond(&mut stream, 500, b"bad positions\n");
+                respond(&mut stream, 400, b"bad positions\n");
                 return Ok(());
             };
             let mut c = coord.lock().unwrap();
