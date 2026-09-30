@@ -598,9 +598,13 @@ pub fn train_episode(net: &NTuple, t: &Tables, rng: &mut Rng, alpha: f32, pool: 
             Some((after, r, v)) => {
                 score += r as u64;
                 if top == 15 && made_65536(b, after) {
-                    // The 65536 does not fit a nibble, so the game ends here. The last
-                    // transition is not learned: the afterstate before it keeps its
-                    // bootstrapped value instead of one from a board the engine cannot hold.
+                    // The 65536 does not fit a nibble, so the game ends here. The merge
+                    // leaves it stored as a 32768 (tile downgrading), so `v` is its 65536
+                    // points plus a fresh-32768 board's value: learn it, or the reward for
+                    // the one merge stage 3 exists to teach never reaches the net.
+                    if let Some(p) = prev_after {
+                        net.update(p, alpha, v - net.value(p));
+                    }
                     return EpisodeStats { score, max_rank: 16, fresh, start_rank };
                 }
                 if let Some(p) = prev_after {
