@@ -395,16 +395,24 @@ impl Coord {
             s += &paint("1", rrow("ALL", &total));
         }
 
-        // The restart pool, one line per chain state.
+        // The restart pool, one line per largest tile (per chain state is ~15 lines per tile,
+        // too many for `farm watch`).
         let summary = self.pool.summary();
         if !summary.is_empty() {
-            s += "\n";
-            s += &paint("1", format!("{:<12}{:<10}{:<16}{:<10}{:>12}{:>12}", "POOL", "largest", "chain down to", "free top", "boards", "seen"));
-            s += "\n";
+            let mut rows: Vec<(u8, usize, usize, u64)> = Vec::new();
             for (k, n, seen) in summary {
-                let (m, f, t) = key_parts(k);
-                let tile = |r: u8| if r == 0 { "-".to_string() } else { (1u64 << r).to_string() };
-                s += &format!("{:<12}{:<10}{:<16}{:<10}{:>12}{:>12}\n", "", tile(m), tile(f), tile(t), thousands(n as f64), thousands(seen as f64));
+                let (m, _, _) = key_parts(k);
+                match rows.last_mut() {
+                    Some(r) if r.0 == m => { r.1 += 1; r.2 += n; r.3 += seen; }
+                    _ => rows.push((m, 1, n, seen)),
+                }
+            }
+            s += "\n";
+            s += &paint("1", format!("{:<12}{:<10}{:>10}{:>12}{:>12}", "POOL", "largest", "states", "boards", "seen"));
+            s += "\n";
+            for (m, states, n, seen) in rows {
+                let tile = if m == 0 { "-".to_string() } else { (1u64 << m).to_string() };
+                s += &format!("{:<12}{:<10}{:>10}{:>12}{:>12}\n", "", tile, states, thousands(n as f64), thousands(seen as f64));
             }
         }
         s += &paint("2", format!(
