@@ -9,7 +9,7 @@
 use crate::board::Rng;
 use crate::ntuple::{self, key_parts, NTuple, Pool};
 use std::collections::{HashMap, VecDeque};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
@@ -522,6 +522,24 @@ fn parse_query(target: &str) -> (String, HashMap<String, String>) {
     (path.to_string(), map)
 }
 
+/// Deletes the download links of `path` except the newest two (`keep` and the one before).
+fn prune_links(path: &str, keep: u64) {
+    let p = std::path::Path::new(path);
+    let (dir, name) = (p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new(".")), p.file_name().unwrap_or_default().to_string_lossy());
+    let prefix = format!("{name}.dl-");
+    let mut seqs: Vec<u64> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_string_lossy().strip_prefix(&prefix).and_then(|s| s.parse().ok()))
+        .collect();
+    seqs.sort_unstable();
+    seqs.retain(|&s| s != keep);
+    for s in seqs.iter().rev().skip(1) {
+        let _ = std::fs::remove_file(dir.join(format!("{prefix}{s}")));
+    }
+}
+
 fn respond(stream: &mut TcpStream, code: u16, body: &[u8]) {
     let reason = match code {
         200 => "OK",
@@ -529,6 +547,7 @@ fn respond(stream: &mut TcpStream, code: u16, body: &[u8]) {
         401 => "Unauthorized",
         404 => "Not Found",
         410 => "Gone",
+        416 => "Range Not Satisfiable",
         _ => "Error",
     };
     let head = format!("HTTP/1.1 {code} {reason}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
@@ -541,7 +560,7 @@ fn handle(mut stream: TcpStream, coord: &Mutex<Coord>, token: &str) -> std::io::
     reader.read_line(&mut line)?;
     let mut words = line.split_whitespace();
     let (method, target) = (words.next().unwrap_or("").to_string(), words.next().unwrap_or("").to_string());
-    let (mut len, mut authed) = (0usize, false);
+    let (mut len, mut authed, mut from) = (0usize, false, 0u64);
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h)? <= 2 {
@@ -551,6 +570,8 @@ fn handle(mut stream: TcpStream, coord: &Mutex<Coord>, token: &str) -> std::io::
         match k.trim().to_ascii_lowercase().as_str() {
             "content-length" => len = v.trim().parse().unwrap_or(0),
             "authorization" => authed = v.trim() == format!("Bearer {token}"),
+            // Only the "bytes=N-" form curl -C sends.
+            "range" => from = v.trim().strip_prefix("bytes=").and_then(|r| r.strip_suffix('-')).and_then(|n| n.parse().ok()).unwrap_or(0),
             _ => {}
         }
     }
@@ -583,18 +604,54 @@ fn handle(mut stream: TcpStream, coord: &Mutex<Coord>, token: &str) -> std::io::
             respond(&mut stream, 200, b"ok\n");
         }
         ("GET", "/net") => {
-            // Open under the lock so the file and its seq match even if a save lands mid-download.
+            // Every download is served from a hard link of the saved file named by its seq,
+            // so a broken transfer can resume (Range + ?seq=) from the same bytes after later
+            // saves have replaced the master. Only the newest two links are kept.
+            let resume: Option<u64> = q.get("seq").and_then(|s| s.parse().ok()).filter(|_| from > 0);
             let (mut file, seq) = {
                 let mut c = coord.lock().unwrap();
-                if c.saved_seq != c.seq && c.saved_at.elapsed() > Duration::from_secs(60) {
-                    c.save();
+                let base = c.path.clone();
+                let link = |seq: u64| format!("{base}.dl-{seq}");
+                match resume {
+                    Some(seq) => match std::fs::File::open(link(seq)) {
+                        Ok(f) => (f, seq),
+                        Err(_) => {
+                            drop(c);
+                            respond(&mut stream, 416, b"that net is gone, download it again\n");
+                            return Ok(());
+                        }
+                    },
+                    None => {
+                        if c.saved_seq != c.seq && c.saved_at.elapsed() > Duration::from_secs(60) {
+                            c.save();
+                        }
+                        let seq = c.saved_seq;
+                        if std::fs::metadata(link(seq)).is_err() {
+                            std::fs::hard_link(&base, link(seq))?;
+                        }
+                        prune_links(&base, seq);
+                        (std::fs::File::open(link(seq))?, seq)
+                    }
                 }
-                (std::fs::File::open(&c.path)?, c.saved_seq)
             };
             let size = file.metadata()?.len() + 8;
-            let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n");
+            if from >= size {
+                respond(&mut stream, 416, b"range past the end\n");
+                return Ok(());
+            }
+            let head = if resume.is_some() {
+                format!("HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes {from}-{}/{size}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", size - 1, size - from)
+            } else {
+                format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n")
+            };
             stream.write_all(head.as_bytes())?;
-            stream.write_all(&seq.to_le_bytes())?;
+            if resume.is_some() {
+                // The body is 8 seq bytes then the file; a resume always starts inside the file
+                // (the worker only resumes once it holds the seq).
+                file.seek(std::io::SeekFrom::Start(from.saturating_sub(8)))?;
+            } else {
+                stream.write_all(&seq.to_le_bytes())?;
+            }
             std::io::copy(&mut file, &mut stream)?;
         }
         ("GET", "/deltas") => {
@@ -790,19 +847,47 @@ impl Client {
     }
 }
 
-/// Downloads the master net: 8-byte seq, then the weights file.
+/// Downloads the master net: 8-byte seq, then the weights file. A broken transfer leaves
+/// its partial file behind, and the next call resumes it from the same saved version.
 fn download_net(c: &Client) -> Result<(NTuple, u64), String> {
-    eprintln!("downloading the master net (large, one time)...");
-    let (code, path) = c.call("GET", "/net", None)?;
-    if code != 200 {
+    let path = c.tmp.join("net.part");
+    let have = std::fs::metadata(&path).map_or(0, |m| m.len());
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-sS", "--connect-timeout", "20", "-H", &c.auth, "-o"]).arg(&path).args(["-w", "%{http_code}"]);
+    let url = if have >= 8 {
+        let mut seq = [0u8; 8];
+        std::fs::File::open(&path).and_then(|mut f| f.read_exact(&mut seq)).map_err(|e| e.to_string())?;
+        let seq = u64::from_le_bytes(seq);
+        eprintln!("resuming the master net download at {} MB (update {seq})...", have >> 20);
+        cmd.args(["-C", &have.to_string()]);
+        format!("{}/net?seq={seq}", c.url)
+    } else {
+        eprintln!("downloading the master net (large, one time)...");
+        let _ = std::fs::remove_file(&path);
+        format!("{}/net", c.url)
+    };
+    let r = cmd.arg(&url).output().map_err(|e| format!("running curl: {e}"))?;
+    let code: u16 = String::from_utf8_lossy(&r.stdout).trim().parse().unwrap_or(0);
+    // 416: the file is already whole (a curl that outlived its worker finished it), or its
+    // version is gone from the coordinator. Use it if it loads, else start over.
+    let whole = code == 416;
+    if !whole && !r.status.success() {
+        return Err(format!("curl GET /net: {} (keeping the partial file to resume)", String::from_utf8_lossy(&r.stderr).trim()));
+    }
+    if !whole && code != 200 && code != 206 {
+        let _ = std::fs::remove_file(&path);
         return Err(format!("GET /net: HTTP {code}"));
     }
     let mut f = BufReader::new(std::fs::File::open(&path).map_err(|e| e.to_string())?);
     let mut seq = [0u8; 8];
     f.read_exact(&mut seq).map_err(|e| e.to_string())?;
-    let net = NTuple::load_from(f).map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(path);
-    Ok((net, u64::from_le_bytes(seq)))
+    let net = NTuple::load_from(f);
+    let _ = std::fs::remove_file(&path);
+    match net {
+        Ok(n) => Ok((n, u64::from_le_bytes(seq))),
+        Err(_) if whole => Err("GET /net: the partial download is stale, starting over".into()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// A worker's copy of the master as it last knew it, from the first trainable weight on

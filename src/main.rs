@@ -10,12 +10,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const USAGE: &str = "usage:
-  g2048 bench [games=16] [seed=1] [--net FILE --depth N [--endgame-depth N]]
+  g2048 bench [games=16] [seed=1] [--net FILE --depth N [--endgame-depth N] [--top-bias C]]
   g2048 positions OUT_FILE [count=64] --net FILE [--depth 2]   (boards where 16384 first appears)
   g2048 endgame POS_FILE --net FILE [--depth N] [--cprob P]     (play saved boards to the end)
   g2048 serve --net FILE [--depth N] [--port 20480]
   g2048 coord --net MASTER --token-file F [--port 20490]      (hands out training work)
   g2048 worker --url URL --token-file F [--name N] [--threads N] [--cache DIR]
+  g2048 boundary GAMES --net FILE --vs FILE                    (both nets' view of the 32768 merge)
   g2048 stages FILE [N]                                        (show, or grow to N stages, a saved net)
   g2048 train OUT_FILE [games=1000000] [--resume FILE] [--alpha A] [--seed S] [--tc 1] [--stages 3] [--restart 0.5] [--restart-stage 1] [--tuples 4|8] [--init 320000]";
 
@@ -192,6 +193,58 @@ fn endgame(args: &[String]) {
     );
 }
 
+/// Plays games with `--net` and, wherever a move can make 32768, scores every move as
+/// reward + V(afterstate) under both nets; on boards holding 32768 it also compares each
+/// net's V with the score the game actually went on to make.
+fn boundary(args: &[String]) {
+    let games: u64 = positional(args).first().and_then(|s| s.parse().ok()).unwrap_or(64);
+    let load = |f: &str| Arc::new(NTuple::load(f).unwrap_or_else(|e| panic!("loading {f}: {e}")));
+    let a = load(&flag::<String>(args, "--net").unwrap_or_else(|| panic!("{USAGE}")));
+    let b = load(&flag::<String>(args, "--vs").unwrap_or_else(|| panic!("{USAGE}")));
+    let ai = Arc::new(ai::Ai::with_net(a.clone(), 2));
+    // Per game: (merge chances as [gap under a, gap under b]), (V a, V b, actual return) on 32768 boards.
+    let per = parallel(games, move |g| {
+        let t = ai.tables();
+        let mut rng = Rng((1 + g).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut bd = spawn(spawn(0, &mut rng), &mut rng);
+        let (mut score, mut chances, mut vals) = (0u64, vec![], vec![]);
+        while let Some(d) = ai.best_move(bd) {
+            if max_rank(bd) < 15 {
+                let q = |n: &NTuple| -> (Option<f32>, f32) {
+                    let (mut merge, mut other) = (None, f32::MIN);
+                    for m in DIRS {
+                        let (nb, r) = t.apply(bd, m);
+                        if nb == bd { continue; }
+                        let v = r as f32 + n.value(nb);
+                        if max_rank(nb) >= 15 { merge = Some(merge.map_or(v, |x: f32| x.max(v))); } else { other = other.max(v); }
+                    }
+                    (merge, other)
+                };
+                if let ((Some(ma), oa), (Some(mb), ob)) = (q(&a), q(&b)) {
+                    if oa > f32::MIN { chances.push([ma - oa, mb - ob]); }
+                }
+            } else {
+                vals.push((a.value(bd), b.value(bd), score));
+            }
+            let (nb, r) = t.apply(bd, d);
+            score += r as u64;
+            bd = spawn(nb, &mut rng);
+        }
+        let vals: Vec<[f64; 3]> = vals.into_iter().map(|(va, vb, s)| [va as f64, vb as f64, (score - s) as f64]).collect();
+        (chances, vals)
+    });
+    let chances: Vec<[f32; 2]> = per.iter().flat_map(|p| p.0.clone()).collect();
+    let vals: Vec<[f64; 3]> = per.iter().flat_map(|p| p.1.clone()).collect();
+    let n = chances.len().max(1) as f64;
+    let mean = |i: usize| chances.iter().map(|c| c[i] as f64).sum::<f64>() / n;
+    let best = |i: usize| 100.0 * chances.iter().filter(|c| c[i] > 0.0).count() as f64 / n;
+    println!("{} positions where a move makes 32768 ({} games)", chances.len(), games);
+    println!("  merge minus best other move:  --net {:>9.0} (merge best {:>5.1}%)   --vs {:>9.0} (merge best {:>5.1}%)", mean(0), best(0), mean(1), best(1));
+    let m = vals.len().max(1) as f64;
+    let avg = |i: usize| vals.iter().map(|v| v[i]).sum::<f64>() / m;
+    println!("{} boards holding 32768: mean V  --net {:.0}  --vs {:.0}  actual score still to come {:.0}", vals.len(), avg(0), avg(1), avg(2));
+}
+
 fn bench(args: &[String]) {
     let pos = positional(args);
     let games: u64 = pos.first().and_then(|s| s.parse().ok()).unwrap_or(16);
@@ -199,7 +252,7 @@ fn bench(args: &[String]) {
     let ai = Arc::new(match flag::<String>(args, "--net") {
         Some(path) => {
             let net = NTuple::load(&path).unwrap_or_else(|e| panic!("loading {path}: {e}"));
-            ai::Ai::with_net(Arc::new(net), flag(args, "--depth").unwrap_or(2)).with_endgame_depth(flag(args, "--endgame-depth"))
+            ai::Ai::with_net(Arc::new(net), flag(args, "--depth").unwrap_or(2)).with_endgame_depth(flag(args, "--endgame-depth")).with_top_bias(flag(args, "--top-bias"))
         }
         None => ai::Ai::new(),
     });
@@ -375,6 +428,7 @@ fn main() {
         Some("positions") => positions(&args[1..]),
         Some("endgame") => endgame(&args[1..]),
         Some("stages") => stages(&args[1..]),
+        Some("boundary") => boundary(&args[1..]),
         Some("coord") => {
             let a = &args[1..];
             dist::coord(flag(a, "--net").unwrap_or_else(|| panic!("{USAGE}")), token(a), flag(a, "--port").unwrap_or(20490))

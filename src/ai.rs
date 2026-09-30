@@ -27,6 +27,9 @@ pub struct Ai {
     endgame_depth: Option<u32>,
     /// Branches less likely than this are cut off and scored by the evaluator directly.
     cprob_thresh: f32,
+    /// Added to the net's value on boards scored by its last stage (an experiment in
+    /// lining up a retrained top stage with the frozen stage below it).
+    top_bias: f32,
 }
 
 struct Search<'a> {
@@ -70,7 +73,7 @@ fn row_heur(row: u16) -> f32 {
 
 impl Ai {
     pub fn new() -> Self {
-        Ai { t: Tables::new(), heur: (0..=u16::MAX).map(row_heur).collect(), net: None, depth: None, endgame_depth: None, cprob_thresh: CPROB_THRESH }
+        Ai { t: Tables::new(), heur: (0..=u16::MAX).map(row_heur).collect(), net: None, depth: None, endgame_depth: None, cprob_thresh: CPROB_THRESH, top_bias: 0.0 }
     }
 
     pub fn with_net(net: Arc<NTuple>, depth: u32) -> Self {
@@ -81,6 +84,11 @@ impl Ai {
         if let Some(c) = c {
             self.cprob_thresh = c;
         }
+        self
+    }
+
+    pub fn with_top_bias(mut self, c: Option<f32>) -> Self {
+        self.top_bias = c.unwrap_or(0.0);
         self
     }
 
@@ -101,7 +109,8 @@ impl Ai {
 
     fn eval(&self, b: Board) -> f32 {
         if let Some(net) = &self.net {
-            return net.value(b);
+            let top = net.stages() > 1 && net.stage(b) == net.stages() - 1;
+            return net.value(b) + if top { self.top_bias } else { 0.0 };
         }
         let rows = |x: Board| (0..4).map(|r| self.heur[((x >> (16 * r)) & 0xFFFF) as usize]).sum::<f32>();
         rows(b) + rows(transpose(b))
