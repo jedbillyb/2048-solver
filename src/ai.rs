@@ -71,6 +71,26 @@ pub struct Ai {
     /// (3 unless given) and spawns below 1 / 2^(depth + 4) are cut, as macroxue plays.
     endgame_eval: bool,
     endgame_rank: u8,
+    /// macroxue's `pass_score` cut after the handover: chance nodes scoring below twice
+    /// the largest tile's cost are not expanded. `big` is its BIG_TUPLES variant.
+    pass_score: Option<PassScore>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PassScore {
+    Small,
+    Big,
+}
+
+impl std::str::FromStr for PassScore {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        match s {
+            "small" => Ok(PassScore::Small),
+            "big" => Ok(PassScore::Big),
+            _ => Err(()),
+        }
+    }
 }
 
 /// What this search uses at its leaves.
@@ -79,6 +99,10 @@ struct Mode {
     /// Score with the heuristic table even though a net is loaded.
     heuristic: bool,
     cprob_thresh: f32,
+    /// Chance nodes whose static value is below this are scored without expanding them.
+    pass: f32,
+    /// Overrides the value of a lost board (macroxue's retry without the cut).
+    dead: Option<f32>,
 }
 
 struct Search<'a> {
@@ -123,7 +147,7 @@ fn row_heur(row: u16) -> f32 {
 
 impl Ai {
     pub fn new() -> Self {
-        Ai { t: Tables::new(), heur: (0..=u16::MAX).map(row_heur).collect(), heuristic: Heuristic::Rows, net: None, depth: None, endgame_depth: None, cprob_thresh: CPROB_THRESH, top_bias: 0.0, lookup: None, lookup_rank: 15, lookup_min: None, endgame_eval: false, endgame_rank: 15 }
+        Ai { t: Tables::new(), heur: (0..=u16::MAX).map(row_heur).collect(), heuristic: Heuristic::Rows, net: None, depth: None, endgame_depth: None, cprob_thresh: CPROB_THRESH, top_bias: 0.0, lookup: None, lookup_rank: 15, lookup_min: None, endgame_eval: false, endgame_rank: 15, pass_score: None }
     }
 
     /// From boards holding a tile of `rank`, play like the heuristic player `h` (with the
@@ -138,6 +162,11 @@ impl Ai {
     }
 
     /// The heuristic player with macroxue's evaluation (no effect once a net is loaded).
+    pub fn with_pass_score(mut self, p: Option<PassScore>) -> Self {
+        self.pass_score = p;
+        self
+    }
+
     pub fn with_heuristic(mut self, h: Heuristic) -> Self {
         if h != self.heuristic {
             self.heuristic = h;
@@ -200,7 +229,9 @@ impl Ai {
     /// The value of a board with no legal move. The net values future points, so none;
     /// macroxue's scores can go negative, so a loss must sit below every live board.
     fn dead(&self, b: Board, mode: Mode) -> f32 {
-        if mode.heuristic && self.heuristic == Heuristic::Macroxue {
+        if let Some(v) = mode.dead {
+            v
+        } else if mode.heuristic && self.heuristic == Heuristic::Macroxue {
             let r = max_rank(b) as i64;
             -((1i64 << 17).max(2 * (r << r)) as f32)
         } else {
@@ -245,11 +276,35 @@ impl Ai {
                 _ => distinct_tiles(b).saturating_sub(2).max(3),
             }
         };
-        let mode = Mode {
+        let mut mode = Mode {
             heuristic: self.heuristic_board(b),
             // macroxue's spawn cut once its evaluation plays, unless --cprob was given.
             cprob_thresh: if handed_over && self.cprob_thresh == CPROB_THRESH { 1.0 / (1u64 << (depth_limit + 4)) as f32 } else { self.cprob_thresh },
+            pass: f32::NEG_INFINITY,
+            dead: None,
         };
+        let pass_score = self.pass_score.filter(|_| mode.heuristic && self.heuristic == Heuristic::Macroxue);
+        if let Some(p) = pass_score {
+            // As macroxue's Node::Search: the cut is off when the board already scores badly.
+            let r = max_rank(b) as i64;
+            let twice_max = (2 * (r << r)) as f32;
+            let score = self.eval(b, mode);
+            let floor = if p == PassScore::Big { twice_max } else { 0.0 };
+            if score >= floor {
+                mode.pass = twice_max;
+            }
+        }
+        let (best, value) = self.root(b, depth_limit, mode);
+        // BIG_TUPLES: a losing-looking root is searched again with no cut and a harsher loss.
+        if pass_score == Some(PassScore::Big) && value < 0.0 {
+            mode.pass = f32::NEG_INFINITY;
+            mode.dead = Some(-((1i64 << 22) as f32));
+            return self.root(b, depth_limit, mode).0;
+        }
+        best
+    }
+
+    fn root(&self, b: Board, depth_limit: u32, mode: Mode) -> (Option<Dir>, f32) {
         let mut s = Search { ai: self, depth_limit, mode, tt: HashMap::new() };
         let mut best: Option<(Dir, f32)> = None;
         for d in DIRS {
@@ -262,7 +317,7 @@ impl Ai {
                 best = Some((d, v));
             }
         }
-        best.map(|(d, _)| d)
+        (best.map(|(d, _)| d), best.map_or(f32::NEG_INFINITY, |(_, v)| v))
     }
 }
 
@@ -270,6 +325,12 @@ impl Search<'_> {
     fn chance(&mut self, b: Board, cprob: f32, depth: u32) -> f32 {
         if cprob < self.mode.cprob_thresh || depth >= self.depth_limit {
             return self.ai.eval(b, self.mode);
+        }
+        if self.mode.pass > f32::NEG_INFINITY {
+            let v = self.ai.eval(b, self.mode);
+            if v < self.mode.pass {
+                return v;
+            }
         }
         if depth < CACHE_DEPTH_LIMIT {
             if let Some(&(d, v)) = self.tt.get(&b) {
@@ -333,7 +394,7 @@ mod tests {
         let big = grid([[14, 13, 12, 1], [2, 5, 1, 0], [1, 0, 0, 3], [0, 0, 0, 0]]);
         assert_eq!(handover.best_move(big), mx.best_move(big));
         // The loss value only applies while macroxue's evaluation is in charge.
-        let mode = |h| Mode { heuristic: h, cprob_thresh: CPROB_THRESH };
+        let mode = |h| Mode { heuristic: h, cprob_thresh: CPROB_THRESH, pass: f32::NEG_INFINITY, dead: None };
         assert_eq!(handover.dead(big, mode(false)), 0.0);
         assert!(handover.dead(big, mode(true)) < 0.0);
     }

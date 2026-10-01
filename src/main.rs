@@ -128,7 +128,7 @@ fn net_ai(args: &[String], default_depth: u32) -> ai::Ai {
     };
     let endgame_rank: Option<u8> = flag(args, "--endgame-rank");
     let lookup_rank = flag(args, "--lookup-rank").or(if endgame.is_some() { Some(endgame_rank.unwrap_or(15)) } else { None });
-    ai.with_cprob(flag(args, "--cprob")).with_endgame_eval(endgame, endgame_rank).with_lookup(lookup(args), lookup_rank, flag(args, "--lookup-min"))
+    ai.with_cprob(flag(args, "--cprob")).with_pass_score(flag(args, "--pass-score")).with_endgame_eval(endgame, endgame_rank).with_lookup(lookup(args), lookup_rank, flag(args, "--lookup-min"))
 }
 
 /// Saves the endgame tables and reports how often they answered.
