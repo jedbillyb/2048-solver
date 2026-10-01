@@ -2,6 +2,7 @@
 //! trained n-tuple network (which values afterstates in points, so rewards are added).
 
 use crate::board::*;
+use crate::endgame::Lookup;
 use crate::ntuple::NTuple;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,6 +31,11 @@ pub struct Ai {
     /// Added to the net's value on boards scored by its last stage (an experiment in
     /// lining up a retrained top stage with the frozen stage below it).
     top_bias: f32,
+    /// Exact endgame tables, asked first on boards whose largest tile is at least
+    /// `lookup_rank`; their move is taken when its goal probability is above `lookup_min`.
+    lookup: Option<Arc<Lookup>>,
+    lookup_rank: u8,
+    lookup_min: f32,
 }
 
 struct Search<'a> {
@@ -73,7 +79,26 @@ fn row_heur(row: u16) -> f32 {
 
 impl Ai {
     pub fn new() -> Self {
-        Ai { t: Tables::new(), heur: (0..=u16::MAX).map(row_heur).collect(), net: None, depth: None, endgame_depth: None, cprob_thresh: CPROB_THRESH, top_bias: 0.0 }
+        Ai { t: Tables::new(), heur: (0..=u16::MAX).map(row_heur).collect(), net: None, depth: None, endgame_depth: None, cprob_thresh: CPROB_THRESH, top_bias: 0.0, lookup: None, lookup_rank: 15, lookup_min: 0.0 }
+    }
+
+    /// A fixed search depth for the heuristic player too (None keeps its adaptive depth).
+    pub fn with_depth(mut self, d: Option<u32>) -> Self {
+        if let Some(d) = d {
+            self.depth = Some(d.max(1));
+        }
+        self
+    }
+
+    pub fn with_lookup(mut self, lookup: Option<Arc<Lookup>>, rank: Option<u8>, min: Option<f32>) -> Self {
+        self.lookup = lookup;
+        self.lookup_rank = rank.unwrap_or(15);
+        self.lookup_min = min.unwrap_or(0.0);
+        self
+    }
+
+    pub fn lookup(&self) -> Option<&Arc<Lookup>> {
+        self.lookup.as_ref()
     }
 
     pub fn with_net(net: Arc<NTuple>, depth: u32) -> Self {
@@ -118,6 +143,18 @@ impl Ai {
 
     /// Best legal move, or None if the game is over.
     pub fn best_move(&self, b: Board) -> Option<Dir> {
+        if let Some(lk) = &self.lookup {
+            if max_rank(b) >= self.lookup_rank {
+                if let Some((d, _)) = lk.suggest(b, self.lookup_min) {
+                    return Some(d);
+                }
+            }
+        }
+        self.search_move(b)
+    }
+
+    /// Best legal move by expectimax alone.
+    pub fn search_move(&self, b: Board) -> Option<Dir> {
         let mut s = Search { ai: self, depth_limit: match (self.endgame_depth, self.depth) {
                 (Some(e), _) if max_rank(b) >= 14 => e,
                 (_, Some(d)) => d,

@@ -1,6 +1,7 @@
 mod ai;
 mod board;
 mod dist;
+mod endgame;
 mod ntuple;
 
 use board::*;
@@ -10,9 +11,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const USAGE: &str = "usage:
-  g2048 bench [games=16] [seed=1] [--net FILE --depth N [--endgame-depth N] [--top-bias C]]
-  g2048 positions OUT_FILE [count=64] --net FILE [--depth 2]   (boards where 16384 first appears)
-  g2048 endgame POS_FILE --net FILE [--depth N] [--cprob P]     (play saved boards to the end)
+  g2048 bench [games=16] [seed=1] [--net FILE] [--depth N] [--endgame-depth N] [--top-bias C] [LOOKUP]
+  g2048 positions OUT_FILE [count=64] --net FILE [--depth 2] [--rank 14]   (boards where the tile first appears)
+  g2048 endgame POS_FILE --net FILE [--depth N] [--cprob P] [LOOKUP]       (play saved boards to the end)
+  g2048 formation POS_FILE [--layouts L]                        (which endgame layouts the boards fit)
+    LOOKUP: --tables DIR [--layouts block10,five7] [--lookup-rank 15] [--lookup-min 0]
+            exact endgame tables (macroxue style), filled on first use and saved in DIR
   g2048 serve --net FILE [--depth N] [--port 20480]
   g2048 coord --net MASTER --token-file F [--port 20490]      (hands out training work)
   g2048 worker --url URL --token-file F [--name N] [--threads N] [--cache DIR]
@@ -86,16 +90,38 @@ fn report(results: &[GameResult], secs: f64, threads: usize) {
     println!("reached 65536: {:>5.1}%", 100.0 * won as f64 / n);
 }
 
-/// Net-backed AI from --net / --depth / --endgame-depth / --cprob,
-/// or the hand-tuned heuristic with adaptive depth when --net is absent.
+/// Endgame tables from --tables DIR and --layouts, or None without --tables.
+fn lookup(args: &[String]) -> Option<Arc<endgame::Lookup>> {
+    let dir: String = flag(args, "--tables")?;
+    let names: String = flag(args, "--layouts").unwrap_or_else(|| "block10,five7".into());
+    let layouts: Vec<_> = names.split(',').map(|n| endgame::Layout::parse(n.trim()).unwrap_or_else(|| panic!("unknown layout {n}; use e.g. block10 or snake8"))).collect();
+    Some(Arc::new(endgame::Lookup::open(std::path::Path::new(&dir), &layouts).unwrap_or_else(|e| panic!("opening endgame tables in {dir}: {e}"))))
+}
+
+/// Net-backed AI from --net / --depth / --endgame-depth / --cprob / --top-bias and the
+/// endgame tables, or the hand-tuned heuristic (adaptive depth unless --depth) when --net
+/// is absent.
 fn net_ai(args: &[String], default_depth: u32) -> ai::Ai {
-    let Some(path) = flag::<String>(args, "--net") else {
-        return ai::Ai::new().with_cprob(flag(args, "--cprob"));
+    let ai = match flag::<String>(args, "--net") {
+        None => ai::Ai::new().with_depth(flag(args, "--depth")),
+        Some(path) => {
+            let net = NTuple::load(&path).unwrap_or_else(|e| panic!("loading {path}: {e}"));
+            ai::Ai::with_net(Arc::new(net), flag(args, "--depth").unwrap_or(default_depth)).with_endgame_depth(flag(args, "--endgame-depth")).with_top_bias(flag(args, "--top-bias"))
+        }
     };
-    let net = NTuple::load(&path).unwrap_or_else(|e| panic!("loading {path}: {e}"));
-    ai::Ai::with_net(Arc::new(net), flag(args, "--depth").unwrap_or(default_depth))
-        .with_endgame_depth(flag(args, "--endgame-depth"))
-        .with_cprob(flag(args, "--cprob"))
+    ai.with_cprob(flag(args, "--cprob")).with_lookup(lookup(args), flag(args, "--lookup-rank"), flag(args, "--lookup-min"))
+}
+
+/// Saves the endgame tables and reports how often they answered.
+fn finish_lookup(ai: &ai::Ai, moves: u64) {
+    let Some(lk) = ai.lookup() else { return };
+    let hits = lk.hits.load(std::sync::atomic::Ordering::Relaxed);
+    let asked = lk.asked.load(std::sync::atomic::Ordering::Relaxed);
+    let tables: Vec<String> = lk.tables().iter().map(|t| format!("{} {}", t.layout.name(), t.computed())).collect();
+    println!("endgame tables: {} of {} moves from a table ({} boards asked); positions known: {}", hits, moves, asked, tables.join(", "));
+    if let Err(e) = lk.save() {
+        eprintln!("saving endgame tables: {e}");
+    }
 }
 
 /// Runs `job(i)` for i in 0..n across all cores, returning results in index order.
@@ -127,13 +153,16 @@ fn positions(args: &[String]) {
     let pos = positional(args);
     let out = pos.first().unwrap_or_else(|| panic!("{USAGE}")).to_string();
     let count: u64 = pos.get(1).and_then(|s| s.parse().ok()).unwrap_or(64);
+    let rank: u8 = flag(args, "--rank").unwrap_or(14);
     let ai = Arc::new(net_ai(args, 2));
-    let found = parallel(count * 2, move |i| {
+    // Rarer tiles need more games per board kept.
+    let tries = count * if rank >= 15 { 4 } else { 2 };
+    let found = parallel(tries, move |i| {
         let mut rng = Rng((5000 + i).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let mut b = spawn(spawn(0, &mut rng), &mut rng);
         while let Some(d) = ai.best_move(b) {
             b = spawn(ai.tables().apply(b, d).0, &mut rng);
-            if max_rank(b) >= 14 {
+            if max_rank(b) >= rank {
                 return Some(b);
             }
         }
@@ -145,16 +174,22 @@ fn positions(args: &[String]) {
     println!("saved {} boards to {out}", boards.len());
 }
 
+/// Boards from a positions file: the first word of each line, 16 hex ranks.
+fn read_boards(file: &str) -> Vec<Board> {
+    std::fs::read_to_string(file)
+        .unwrap_or_else(|e| panic!("reading {file}: {e}"))
+        .lines()
+        .filter_map(|l| u64::from_str_radix(l.split_whitespace().next()?, 16).ok())
+        .collect()
+}
+
 /// Plays each saved board to the end and reports how often 32768 / 65536 follow.
 fn endgame(args: &[String]) {
     let pos = positional(args);
     let file = pos.first().unwrap_or_else(|| panic!("{USAGE}"));
-    let boards: Vec<Board> = std::fs::read_to_string(file)
-        .expect("reading positions")
-        .lines()
-        .filter_map(|l| u64::from_str_radix(l.trim(), 16).ok())
-        .collect();
+    let boards = read_boards(file);
     let ai = Arc::new(net_ai(args, 2));
+    let ai2 = ai.clone();
     let start = Instant::now();
     let n = boards.len() as u64;
     let boards = Arc::new(boards);
@@ -163,6 +198,7 @@ fn endgame(args: &[String]) {
     let done = Arc::new(AtomicU64::new(0));
     let (progress2, done2) = (progress.clone(), done.clone());
     let results = parallel(n, move |i| {
+        let ai = &ai2;
         let mut rng = Rng((9000 + i).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let mut b = boards[i as usize];
         let (mut moves, mut won) = (0u64, false);
@@ -182,6 +218,7 @@ fn endgame(args: &[String]) {
     let _ = std::fs::remove_file(&progress);
     let pct = |f: &dyn Fn(&(u8, bool, u64)) -> bool| 100.0 * results.iter().filter(|r| f(r)).count() as f64 / n as f64;
     let moves: u64 = results.iter().map(|r| r.2).sum();
+    finish_lookup(&ai, moves);
     println!(
         "{} boards  32768 {:>5.1}%  65536 {:>5.1}%  avg moves {:.0}  {:.0}s ({:.0} moves/s)",
         n,
@@ -245,17 +282,26 @@ fn boundary(args: &[String]) {
     println!("{} boards holding 32768: mean V  --net {:.0}  --vs {:.0}  actual score still to come {:.0}", vals.len(), avg(0), avg(1), avg(2));
 }
 
+/// `g2048 probe POS_FILE --tables DIR [--layouts L]`: for each saved board, the table's
+/// move and goal probability (or "-"), to compare against another implementation.
+fn probe(args: &[String]) {
+    let file = positional(args).first().unwrap_or_else(|| panic!("{USAGE}")).to_string();
+    let boards = read_boards(&file);
+    let lk = lookup(args).unwrap_or_else(|| panic!("probe needs --tables DIR"));
+    for b in boards {
+        match lk.suggest(b, -1.0) {
+            Some((d, p)) => println!("{b:016x} {} {p:.4}", format!("{d:?}").to_lowercase()),
+            None => println!("{b:016x} - -"),
+        }
+    }
+    let _ = lk.save();
+}
+
 fn bench(args: &[String]) {
     let pos = positional(args);
     let games: u64 = pos.first().and_then(|s| s.parse().ok()).unwrap_or(16);
     let seed0: u64 = pos.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
-    let ai = Arc::new(match flag::<String>(args, "--net") {
-        Some(path) => {
-            let net = NTuple::load(&path).unwrap_or_else(|e| panic!("loading {path}: {e}"));
-            ai::Ai::with_net(Arc::new(net), flag(args, "--depth").unwrap_or(2)).with_endgame_depth(flag(args, "--endgame-depth")).with_top_bias(flag(args, "--top-bias"))
-        }
-        None => ai::Ai::new(),
-    });
+    let ai = Arc::new(net_ai(args, 2));
     let nt = threads(games);
     let next = Arc::new(AtomicU64::new(0));
     let start = Instant::now();
@@ -279,6 +325,27 @@ fn bench(args: &[String]) {
         .collect();
     let results: Vec<GameResult> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
     report(&results, start.elapsed().as_secs_f64(), nt);
+    finish_lookup(&ai, results.iter().map(|r| r.moves).sum());
+}
+
+/// `g2048 formation POS_FILE [--layouts L]`: how many saved boards some endgame layout
+/// applies to, in any orientation, so a net's corner shape can be checked against the
+/// tables before playing with them.
+fn formation(args: &[String]) {
+    let file = positional(args).first().unwrap_or_else(|| panic!("{USAGE}")).to_string();
+    let boards = read_boards(&file);
+    let names: String = flag(args, "--layouts").unwrap_or_else(|| "block10,five7,snake8".into());
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for name in names.split(',') {
+        let layout = endgame::Layout::parse(name.trim()).unwrap_or_else(|| panic!("unknown layout {name}"));
+        let lk = endgame::Lookup::open(&std::env::temp_dir().join("g2048-formation"), &[layout]).expect("tables");
+        let n = boards.iter().filter(|&&b| lk.applies(b).is_some()).count();
+        counts.push((name.trim().to_string(), n));
+    }
+    println!("{} boards", boards.len());
+    for (name, n) in counts {
+        println!("  {name:<10} applies to {n:>6} ({:.1}%)", 100.0 * n as f64 / boards.len().max(1) as f64);
+    }
 }
 
 fn train(args: &[String]) {
@@ -427,6 +494,8 @@ fn main() {
         Some("serve") => serve(&args[1..]),
         Some("positions") => positions(&args[1..]),
         Some("endgame") => endgame(&args[1..]),
+        Some("formation") => formation(&args[1..]),
+        Some("probe") => probe(&args[1..]),
         Some("stages") => stages(&args[1..]),
         Some("boundary") => boundary(&args[1..]),
         Some("coord") => {

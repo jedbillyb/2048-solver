@@ -75,7 +75,7 @@ fn huge_vec<T>(n: usize, f: impl FnMut(usize) -> T) -> Vec<T> {
     v
 }
 
-fn symmetries(c: usize) -> [usize; 8] {
+pub fn symmetries(c: usize) -> [usize; 8] {
     let (r, k) = (c / 4, c % 4);
     let pts = [(r, k), (k, 3 - r), (3 - r, 3 - k), (3 - k, r), (r, 3 - k), (3 - k, 3 - r), (3 - r, k), (k, r)];
     pts.map(|(a, b)| a * 4 + b)
