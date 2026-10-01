@@ -18,9 +18,38 @@ const SUM_W: f32 = 11.0;
 const MERGES_W: f32 = 700.0;
 const EMPTY_W: f32 = 270.0;
 
+/// macroxue/2048-ai's line score: T(r) = r * 2^r per tile, a bonus for each pair that
+/// descends left to right and a steep penalty for each that ascends, so big tiles are
+/// pushed to the top-left corner. Rows and columns are summed in that one orientation.
+fn mx_line(row: u16) -> f32 {
+    let ts = |c: usize| {
+        let r = ((row >> (4 * c)) & 0xF) as i64;
+        (r << r) as f32
+    };
+    let mut score = ts(0);
+    for c in 0..3 {
+        let (a, b) = (ts(c), ts(c + 1));
+        score += if a >= b { a + b } else { (a - b) * 12.0 };
+        if a == b {
+            score += a;
+        }
+    }
+    score
+}
+
+/// How leaves are scored when no net is loaded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Heuristic {
+    /// The row heuristic below (monotonicity, merges, empties), symmetric in orientation.
+    Rows,
+    /// macroxue's corner-seeking line score, with a large negative value for a lost board.
+    Macroxue,
+}
+
 pub struct Ai {
     t: Tables,
     heur: Vec<f32>,
+    heuristic: Heuristic,
     net: Option<Arc<NTuple>>,
     /// Fixed search depth in chance layers; None = heuristic's adaptive depth.
     depth: Option<u32>,
@@ -79,7 +108,16 @@ fn row_heur(row: u16) -> f32 {
 
 impl Ai {
     pub fn new() -> Self {
-        Ai { t: Tables::new(), heur: (0..=u16::MAX).map(row_heur).collect(), net: None, depth: None, endgame_depth: None, cprob_thresh: CPROB_THRESH, top_bias: 0.0, lookup: None, lookup_rank: 15, lookup_min: 0.0 }
+        Ai { t: Tables::new(), heur: (0..=u16::MAX).map(row_heur).collect(), heuristic: Heuristic::Rows, net: None, depth: None, endgame_depth: None, cprob_thresh: CPROB_THRESH, top_bias: 0.0, lookup: None, lookup_rank: 15, lookup_min: 0.0 }
+    }
+
+    /// The heuristic player with macroxue's evaluation (no effect once a net is loaded).
+    pub fn with_heuristic(mut self, h: Heuristic) -> Self {
+        if h != self.heuristic {
+            self.heuristic = h;
+            self.heur = (0..=u16::MAX).map(if h == Heuristic::Macroxue { mx_line } else { row_heur }).collect();
+        }
+        self
     }
 
     /// A fixed search depth for the heuristic player too (None keeps its adaptive depth).
@@ -126,6 +164,18 @@ impl Ai {
     #[inline]
     fn reward(&self, r: u32) -> f32 {
         if self.net.is_some() { r as f32 } else { 0.0 }
+    }
+
+    /// The value of a board with no legal move. The net values future points, so none;
+    /// macroxue's scores can go negative, so a loss must sit below every live board.
+    fn dead(&self, b: Board) -> f32 {
+        match (&self.net, self.heuristic) {
+            (None, Heuristic::Macroxue) => {
+                let r = max_rank(b) as i64;
+                -((1i64 << 17).max(2 * (r << r)) as f32)
+            }
+            _ => 0.0,
+        }
     }
 
     pub fn tables(&self) -> &Tables {
@@ -211,6 +261,6 @@ impl Search<'_> {
                 best = best.max(self.ai.reward(r) + self.chance(nb, cprob, depth + 1));
             }
         }
-        if best == f32::NEG_INFINITY { 0.0 } else { best }
+        if best == f32::NEG_INFINITY { self.ai.dead(b) } else { best }
     }
 }

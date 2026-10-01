@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const USAGE: &str = "usage:
-  g2048 bench [games=16] [seed=1] [--net FILE] [--depth N] [--endgame-depth N] [--top-bias C] [LOOKUP]
+  g2048 bench [games=16] [seed=1] [--net FILE] [--depth N] [--endgame-depth N] [--top-bias C] [--eval rows|mx] [LOOKUP]
   g2048 positions OUT_FILE [count=64] --net FILE [--depth 2] [--rank 14]   (boards where the tile first appears)
   g2048 endgame POS_FILE --net FILE [--depth N] [--cprob P] [LOOKUP]       (play saved boards to the end)
   g2048 formation POS_FILE [--layouts L]                        (which endgame layouts the boards fit)
@@ -103,7 +103,14 @@ fn lookup(args: &[String]) -> Option<Arc<endgame::Lookup>> {
 /// is absent.
 fn net_ai(args: &[String], default_depth: u32) -> ai::Ai {
     let ai = match flag::<String>(args, "--net") {
-        None => ai::Ai::new().with_depth(flag(args, "--depth")),
+        None => {
+            let h = match flag::<String>(args, "--eval").as_deref() {
+                None | Some("rows") => ai::Heuristic::Rows,
+                Some("mx") => ai::Heuristic::Macroxue,
+                Some(other) => panic!("unknown --eval {other}; use rows or mx"),
+            };
+            ai::Ai::new().with_heuristic(h).with_depth(flag(args, "--depth"))
+        }
         Some(path) => {
             let net = NTuple::load(&path).unwrap_or_else(|e| panic!("loading {path}: {e}"));
             ai::Ai::with_net(Arc::new(net), flag(args, "--depth").unwrap_or(default_depth)).with_endgame_depth(flag(args, "--endgame-depth")).with_top_bias(flag(args, "--top-bias"))
