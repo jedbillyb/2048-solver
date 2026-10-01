@@ -217,3 +217,53 @@ larger five-anchor table (27 GB). Both apply on top of this branch without code 
 bound would need raising from 7 to 8 in `Layout::parse`; `five8` is 11 GB of address
 space). A 65536 as a real tile needs the u128 board of `DESIGN.md` Release B on branch
 `stage3`; nothing here depends on it, since the game ends at the merge that makes 65536.
+
+## 7. Second round: hand the endgame to macroxue's player
+
+Result of section 5 on the real net (2026-10-01): tables answered 1.2% of moves, 0 of
+1000 boards reached 65536 with or without them, and at the first 32768 no layout fitted
+(`block10` 0%, `five7` 1.4%, `snake8` 0%). The first-32768 board is uninformative, since
+the chain that built the tile has just been consumed, but 1.2% of moves against about
+70% in macroxue's own games says the net plays the endgame in a shape the tables never
+see. The tables need a player that forms the block; the net has no drive to do so.
+
+So the next experiment keeps the net for the part it is best at and hands the rest to
+the player that is known to convert: `--endgame-eval mx` switches, from the first board
+holding `--endgame-rank` (default 15), to macroxue's evaluation, no move reward, its loss
+value, its spawn cut `1 / 2^(depth + 4)`, depth 3 (or `--endgame-depth`), and the tables
+from the same board on. Before that board nothing changes. macroxue converts a 32768
+board to 65536 about 2.5% of the time at depth 3 and about 4% at depth 5 to 8, and its
+games enter that phase from the same "32768 plus leftovers" boards.
+
+```sh
+B=./target/release/g2048; NET=nets/otd-stage2.bin
+
+# A. From the 1000 fixed 32768 boards (both handover ranks are the same here, since every
+#    board already holds 32768): macroxue's player from move one, depth 3 and depth 4.
+$B endgame pos32k.txt --net $NET --depth 2 --endgame-eval mx --endgame-depth 3 --tables tables
+$B endgame pos32k.txt --net $NET --depth 2 --endgame-eval mx --endgame-depth 4 --tables tables
+
+# B. Fresh games, same seeds as the 559,404 baseline: handover at 32768 and at 16384.
+$B bench 600 201 --net $NET --depth 2
+$B bench 600 201 --net $NET --depth 2 --endgame-eval mx --endgame-rank 15 --tables tables
+$B bench 600 201 --net $NET --depth 2 --endgame-eval mx --endgame-rank 14 --tables tables
+```
+
+Expectations, from macroxue's measured rates:
+
+| run | 65536 | other signs |
+|---|---|---|
+| A, depth 3 | about 25 of 1000 (2.5%); 10 or more is a clear gain over 0 of 1000 | table share of moves far above 1.2%; average moves survived up from 10,000 |
+| A, depth 4 | about 30 of 1000; 13x slower per move than depth 3 | |
+| B, handover at 32768 | 60% of games reach 32768, about 2.5% of those convert: 8 to 10 of 600 | mean score near the 559k baseline, since the opening is the net's |
+| B, handover at 16384 | macroxue converts 16384 to 65536 about 1.6% of the time (1.3 of 81.4), the net reaches 16384 in about 95%: 8 to 10 of 600 | 32768 rate near 60% if their 16384 to 32768 conversion (64%) matches the net's; a lower mean score says the net was the better 16384 player |
+
+If A gives 10 or more, 65536 is reached and the branch does what it was for. The two B
+rows then say where the handover belongs: equal 65536 counts with a higher mean score
+for the rank-15 run means hand over as late as possible. If A gives under 5, macroxue's
+player does not convert from the net's boards either, and the remaining lever is depth
+(`--endgame-depth 5` is their 2.7% to 3.3% range, at 500 moves/s per thread).
+
+Speed in the handed-over phase is about 5,000 moves/s per thread at depth 3 with the
+tables loaded; run A is 10 to 15 million moves, a few minutes on 8 threads. The tables
+grow as new regions come up and are saved at the end of every run.
