@@ -278,13 +278,19 @@ Fresh games, `bench 600 201`, same seeds throughout (2026-10-01):
 | macroxue from 32768, depth 4 | 7 | | 565,099 | 13 min |
 | macroxue from 32768, depth 5 | 8 (1.3%) | | 575,216 | 19 min |
 | macroxue from 16384, depth 3 | 2 | 41.5% | 451k | |
-| macroxue from 16384, depth 5 | running | | | |
+| macroxue from 16384, depth 5 | 8 (1.3%) | 65.3% | 598,065 | 27 min |
 
 65536 is reached: about one fresh game in 80, from none. Given a 32768 the conversion
-is about 2.2% (8 of roughly 360), against 3.6% for macroxue's own program at depth 5
-from boards it shaped itself. The 16384 handover at depth 3 shows the transfer penalty
-directly: macroxue converts its own 16384 boards to 32768 64% of the time at that depth,
-the net's boards only 41.5%.
+is about 2% (8 of roughly 360 or 390), against 3.6% for macroxue's own program at depth
+5 from boards it shaped itself. The 16384 handover shows the transfer penalty directly:
+at depth 3 macroxue converts its own 16384 boards to 32768 64% of the time, the net's
+boards only 41.5%; at depth 5 it is 78% against 69% (65.3 of 95), still better than the
+net's 63% at depth 2, which is why the rank-14 run has the best 32768 rate and mean
+score so far. Its 65536 conversion did not move, so the shape of the board at handover
+is not what holds conversion at 2%. Note the counts: 8 observed where 3.6% of 390 would
+give 14 is a 1.6-sigma gap, so part of the shortfall against macroxue may be noise;
+1000 attempts on `pos32k.txt` read conversion three times more sharply than 600 fresh
+games.
 
 **Levers left**, in order of expected effect:
 
