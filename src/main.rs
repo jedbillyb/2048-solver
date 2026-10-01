@@ -17,6 +17,8 @@ const USAGE: &str = "usage:
   g2048 formation POS_FILE [--layouts L]                        (which endgame layouts the boards fit)
     LOOKUP: --tables DIR [--layouts block10,five7] [--lookup-rank 15] [--lookup-min 0]
             exact endgame tables (macroxue style), filled on first use and saved in DIR
+            --endgame-eval mx [--endgame-rank 15] [--endgame-depth 3]: from a board holding
+            that rank, play like macroxue (its evaluation and depth) instead of the net
   g2048 serve --net FILE [--depth N] [--port 20480]
   g2048 coord --net MASTER --token-file F [--port 20490]      (hands out training work)
   g2048 worker --url URL --token-file F [--name N] [--threads N] [--cache DIR]
@@ -116,7 +118,16 @@ fn net_ai(args: &[String], default_depth: u32) -> ai::Ai {
             ai::Ai::with_net(Arc::new(net), flag(args, "--depth").unwrap_or(default_depth)).with_endgame_depth(flag(args, "--endgame-depth")).with_top_bias(flag(args, "--top-bias"))
         }
     };
-    ai.with_cprob(flag(args, "--cprob")).with_lookup(lookup(args), flag(args, "--lookup-rank"), flag(args, "--lookup-min"))
+    // --endgame-eval mx [--endgame-rank R]: from a board holding rank R (default 15),
+    // play like macroxue (its evaluation, depth 3 unless --endgame-depth, its tables).
+    let endgame = match flag::<String>(args, "--endgame-eval").as_deref() {
+        None => None,
+        Some("mx") => Some(ai::Heuristic::Macroxue),
+        Some(other) => panic!("unknown --endgame-eval {other}; use mx"),
+    };
+    let endgame_rank: Option<u8> = flag(args, "--endgame-rank");
+    let lookup_rank = flag(args, "--lookup-rank").or(if endgame.is_some() { Some(endgame_rank.unwrap_or(15)) } else { None });
+    ai.with_cprob(flag(args, "--cprob")).with_endgame_eval(endgame, endgame_rank).with_lookup(lookup(args), lookup_rank, flag(args, "--lookup-min"))
 }
 
 /// Saves the endgame tables and reports how often they answered.

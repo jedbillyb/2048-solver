@@ -65,11 +65,26 @@ pub struct Ai {
     lookup: Option<Arc<Lookup>>,
     lookup_rank: u8,
     lookup_min: f32,
+    /// Hand the endgame to the heuristic: from boards whose largest tile is at least
+    /// `endgame_rank`, leaves are scored by `heuristic` instead of the net, moves carry
+    /// no reward, a loss is macroxue's negative score, the depth is `endgame_depth`
+    /// (3 unless given) and spawns below 1 / 2^(depth + 4) are cut, as macroxue plays.
+    endgame_eval: bool,
+    endgame_rank: u8,
+}
+
+/// What this search uses at its leaves.
+#[derive(Clone, Copy)]
+struct Mode {
+    /// Score with the heuristic table even though a net is loaded.
+    heuristic: bool,
+    cprob_thresh: f32,
 }
 
 struct Search<'a> {
     ai: &'a Ai,
     depth_limit: u32,
+    mode: Mode,
     tt: HashMap<Board, (u32, f32)>,
 }
 
@@ -108,7 +123,18 @@ fn row_heur(row: u16) -> f32 {
 
 impl Ai {
     pub fn new() -> Self {
-        Ai { t: Tables::new(), heur: (0..=u16::MAX).map(row_heur).collect(), heuristic: Heuristic::Rows, net: None, depth: None, endgame_depth: None, cprob_thresh: CPROB_THRESH, top_bias: 0.0, lookup: None, lookup_rank: 15, lookup_min: 0.0 }
+        Ai { t: Tables::new(), heur: (0..=u16::MAX).map(row_heur).collect(), heuristic: Heuristic::Rows, net: None, depth: None, endgame_depth: None, cprob_thresh: CPROB_THRESH, top_bias: 0.0, lookup: None, lookup_rank: 15, lookup_min: 0.0, endgame_eval: false, endgame_rank: 15 }
+    }
+
+    /// From boards holding a tile of `rank`, play like the heuristic player `h` (with the
+    /// tables if any) instead of the net.
+    pub fn with_endgame_eval(mut self, h: Option<Heuristic>, rank: Option<u8>) -> Self {
+        if let Some(h) = h {
+            self = self.with_heuristic(h);
+            self.endgame_eval = true;
+            self.endgame_rank = rank.unwrap_or(15);
+        }
+        self
     }
 
     /// The heuristic player with macroxue's evaluation (no effect once a net is loaded).
@@ -160,21 +186,25 @@ impl Ai {
         self
     }
 
+    /// Whether `b` is played by the heuristic: no net, or the endgame handover reached.
+    fn heuristic_board(&self, b: Board) -> bool {
+        self.net.is_none() || (self.endgame_eval && max_rank(b) >= self.endgame_rank)
+    }
+
     /// What a move is worth on top of its afterstate value.
     #[inline]
-    fn reward(&self, r: u32) -> f32 {
-        if self.net.is_some() { r as f32 } else { 0.0 }
+    fn reward(&self, r: u32, mode: Mode) -> f32 {
+        if mode.heuristic { 0.0 } else { r as f32 }
     }
 
     /// The value of a board with no legal move. The net values future points, so none;
     /// macroxue's scores can go negative, so a loss must sit below every live board.
-    fn dead(&self, b: Board) -> f32 {
-        match (&self.net, self.heuristic) {
-            (None, Heuristic::Macroxue) => {
-                let r = max_rank(b) as i64;
-                -((1i64 << 17).max(2 * (r << r)) as f32)
-            }
-            _ => 0.0,
+    fn dead(&self, b: Board, mode: Mode) -> f32 {
+        if mode.heuristic && self.heuristic == Heuristic::Macroxue {
+            let r = max_rank(b) as i64;
+            -((1i64 << 17).max(2 * (r << r)) as f32)
+        } else {
+            0.0
         }
     }
 
@@ -182,8 +212,8 @@ impl Ai {
         &self.t
     }
 
-    fn eval(&self, b: Board) -> f32 {
-        if let Some(net) = &self.net {
+    fn eval(&self, b: Board, mode: Mode) -> f32 {
+        if let (Some(net), false) = (&self.net, mode.heuristic) {
             let top = net.stages() > 1 && net.stage(b) == net.stages() - 1;
             return net.value(b) + if top { self.top_bias } else { 0.0 };
         }
@@ -205,18 +235,29 @@ impl Ai {
 
     /// Best legal move by expectimax alone.
     pub fn search_move(&self, b: Board) -> Option<Dir> {
-        let mut s = Search { ai: self, depth_limit: match (self.endgame_depth, self.depth) {
+        let handed_over = self.net.is_some() && self.heuristic_board(b);
+        let depth_limit = if handed_over {
+            self.endgame_depth.unwrap_or(3)
+        } else {
+            match (self.endgame_depth, self.depth) {
                 (Some(e), _) if max_rank(b) >= 14 => e,
                 (_, Some(d)) => d,
                 _ => distinct_tiles(b).saturating_sub(2).max(3),
-            }, tt: HashMap::new() };
+            }
+        };
+        let mode = Mode {
+            heuristic: self.heuristic_board(b),
+            // macroxue's spawn cut once its evaluation plays, unless --cprob was given.
+            cprob_thresh: if handed_over && self.cprob_thresh == CPROB_THRESH { 1.0 / (1u64 << (depth_limit + 4)) as f32 } else { self.cprob_thresh },
+        };
+        let mut s = Search { ai: self, depth_limit, mode, tt: HashMap::new() };
         let mut best: Option<(Dir, f32)> = None;
         for d in DIRS {
             let (nb, r) = self.t.apply(b, d);
             if nb == b {
                 continue;
             }
-            let v = self.reward(r) + s.chance(nb, 1.0, 0) + 1e-6;
+            let v = self.reward(r, mode) + s.chance(nb, 1.0, 0) + 1e-6;
             if best.map_or(true, |(_, bv)| v > bv) {
                 best = Some((d, v));
             }
@@ -227,8 +268,8 @@ impl Ai {
 
 impl Search<'_> {
     fn chance(&mut self, b: Board, cprob: f32, depth: u32) -> f32 {
-        if cprob < self.ai.cprob_thresh || depth >= self.depth_limit {
-            return self.ai.eval(b);
+        if cprob < self.mode.cprob_thresh || depth >= self.depth_limit {
+            return self.ai.eval(b, self.mode);
         }
         if depth < CACHE_DEPTH_LIMIT {
             if let Some(&(d, v)) = self.tt.get(&b) {
@@ -258,9 +299,42 @@ impl Search<'_> {
         for d in DIRS {
             let (nb, r) = self.ai.t.apply(b, d);
             if nb != b {
-                best = best.max(self.ai.reward(r) + self.chance(nb, cprob, depth + 1));
+                best = best.max(self.ai.reward(r, self.mode) + self.chance(nb, cprob, depth + 1));
             }
         }
-        if best == f32::NEG_INFINITY { self.ai.dead(b) } else { best }
+        if best == f32::NEG_INFINITY { self.ai.dead(b, self.mode) } else { best }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ntuple::{NTuple, TUPLES_4};
+
+    fn grid(g: [[u8; 4]; 4]) -> Board {
+        let mut b = 0;
+        for r in 0..4 {
+            for c in 0..4 {
+                b |= (g[r][c] as u64) << (4 * (4 * r + c));
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn endgame_handover_plays_like_the_heuristic_from_the_given_rank() {
+        let net = Arc::new(NTuple::new(5000.0, 1, &TUPLES_4));
+        let with_net = Ai::with_net(net.clone(), 2);
+        let handover = Ai::with_net(net, 2).with_endgame_eval(Some(Heuristic::Macroxue), Some(14)).with_endgame_depth(Some(2));
+        let mx = Ai::new().with_heuristic(Heuristic::Macroxue).with_depth(Some(2));
+        // Below the handover rank the net decides; from it, macroxue's evaluation does.
+        let small = grid([[11, 10, 9, 1], [2, 3, 1, 0], [1, 0, 0, 0], [0, 0, 0, 0]]);
+        assert_eq!(handover.best_move(small), with_net.best_move(small));
+        let big = grid([[14, 13, 12, 1], [2, 5, 1, 0], [1, 0, 0, 3], [0, 0, 0, 0]]);
+        assert_eq!(handover.best_move(big), mx.best_move(big));
+        // The loss value only applies while macroxue's evaluation is in charge.
+        let mode = |h| Mode { heuristic: h, cprob_thresh: CPROB_THRESH };
+        assert_eq!(handover.dead(big, mode(false)), 0.0);
+        assert!(handover.dead(big, mode(true)) < 0.0);
     }
 }
