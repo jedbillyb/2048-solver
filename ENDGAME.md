@@ -280,6 +280,13 @@ Fresh games, `bench 600 201`, same seeds throughout (2026-10-01):
 | macroxue from 16384, depth 3 | 2 | 41.5% | 451k | |
 | macroxue from 16384, depth 5 | running | | | |
 
+Caveat on the depth-4 and depth-5 rows: until 18512ca, `--endgame-depth` also raised the
+net's own depth from 16384 on (its older meaning), so those runs played 16384 to 32768
+with the net at depth 4 or 5, not at depth 2. Their 65536 counts are still macroxue's
+conversions from the handover point, but the mean scores and the time include a deeper
+net phase, and the rows should be re-run after the fix before being compared with later
+settings.
+
 65536 is reached: about one fresh game in 80, from none. Given a 32768 the conversion
 is about 2.2% (8 of roughly 360), against 3.6% for macroxue's own program at depth 5
 from boards it shaped itself. The 16384 handover at depth 3 shows the transfer penalty
