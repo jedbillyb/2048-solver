@@ -267,3 +267,50 @@ player does not convert from the net's boards either, and the remaining lever is
 Speed in the handed-over phase is about 5,000 moves/s per thread at depth 3 with the
 tables loaded; run A is 10 to 15 million moves, a few minutes on 8 threads. The tables
 grow as new regions come up and are saved at the end of every run.
+
+## 8. Results of the handover, and the bigger five-anchor table
+
+Fresh games, `bench 600 201`, same seeds throughout (2026-10-01):
+
+| 600 fresh games | 65536 | 32768 | mean score | time |
+|---|---|---|---|---|
+| net alone, depth 2 | 0 | 59.8% | 559,404 | 14 min |
+| macroxue from 32768, depth 4 | 7 | | 565,099 | 13 min |
+| macroxue from 32768, depth 5 | 8 (1.3%) | | 575,216 | 19 min |
+| macroxue from 16384, depth 3 | 2 | 41.5% | 451k | |
+| macroxue from 16384, depth 5 | running | | | |
+
+65536 is reached: about one fresh game in 80, from none. Given a 32768 the conversion
+is about 2.2% (8 of roughly 360), against 3.6% for macroxue's own program at depth 5
+from boards it shaped itself. The 16384 handover at depth 3 shows the transfer penalty
+directly: macroxue converts its own 16384 boards to 32768 64% of the time at that depth,
+the net's boards only 41.5%.
+
+**Levers left**, in order of expected effect:
+
+1. The bigger five-anchor table, macroxue's one documented doubling (2019 to 2022 only
+   `Tuple11` grew, cap 7 to 9, and depth-5 conversion went 2.0% to 3.6%). `five8` and
+   `five9` now parse: the five and snake layouts place their canonical anchors at 15
+   downwards whatever the cap, as macroxue does, so the existing `five7` and `snake8`
+   files stay valid. Memory of address space, of which about three quarters get touched:
+   `five7` 2.4 GB, `five8` 11 GB (about 9 GB resident), `five9` 44 GB (about 33 GB). With
+   the laptop at 13.5 GB and OCI at 23.4 GB less 7 GB for the coordinator, `five8` fits
+   on either with training stopped on the laptop; `five9` fits nowhere here.
+
+   ```sh
+   # conversion from the fixed boards, then fresh games; first run builds five8 (minutes)
+   $B endgame pos32k.txt --net $NET --depth 2 --endgame-eval mx --endgame-depth 5 --tables tables --layouts block10,five8
+   $B bench 600 201 --net $NET --depth 2 --endgame-eval mx --endgame-rank 15 --endgame-depth 5 --tables tables --layouts block10,five8
+   ```
+
+   Expected: half of macroxue's doubling, so conversion from about 2.2% towards 3%, 11 or
+   more of 600 fresh games. Keep `five7` out of the layout list when `five8` is in: the
+   larger table covers the smaller one's boards.
+2. Earlier handover at depth 5 (running). Depth 3 says the net is the better 16384
+   player at equal depth; depth 5 starts 14 points higher for macroxue, so it may break
+   even on 32768 and gain on shape.
+3. Depth 6 or 7: about 15% relative per ply at 3x the time each.
+
+Measuring: 7 against 8 cannot be read. For conversions use `pos32k.txt` (1000 attempts);
+for the overall rate and mean score, the fresh-game bench, and 1200 games (`bench 1200
+201`) once two settings are within a few counts of each other.

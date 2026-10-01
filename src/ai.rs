@@ -64,7 +64,7 @@ pub struct Ai {
     /// `lookup_rank`; their move is taken when its goal probability is above `lookup_min`.
     lookup: Option<Arc<Lookup>>,
     lookup_rank: u8,
-    lookup_min: f32,
+    lookup_min: Option<f32>,
     /// Hand the endgame to the heuristic: from boards whose largest tile is at least
     /// `endgame_rank`, leaves are scored by `heuristic` instead of the net, moves carry
     /// no reward, a loss is macroxue's negative score, the depth is `endgame_depth`
@@ -123,7 +123,7 @@ fn row_heur(row: u16) -> f32 {
 
 impl Ai {
     pub fn new() -> Self {
-        Ai { t: Tables::new(), heur: (0..=u16::MAX).map(row_heur).collect(), heuristic: Heuristic::Rows, net: None, depth: None, endgame_depth: None, cprob_thresh: CPROB_THRESH, top_bias: 0.0, lookup: None, lookup_rank: 15, lookup_min: 0.0, endgame_eval: false, endgame_rank: 15 }
+        Ai { t: Tables::new(), heur: (0..=u16::MAX).map(row_heur).collect(), heuristic: Heuristic::Rows, net: None, depth: None, endgame_depth: None, cprob_thresh: CPROB_THRESH, top_bias: 0.0, lookup: None, lookup_rank: 15, lookup_min: None, endgame_eval: false, endgame_rank: 15 }
     }
 
     /// From boards holding a tile of `rank`, play like the heuristic player `h` (with the
@@ -157,7 +157,7 @@ impl Ai {
     pub fn with_lookup(mut self, lookup: Option<Arc<Lookup>>, rank: Option<u8>, min: Option<f32>) -> Self {
         self.lookup = lookup;
         self.lookup_rank = rank.unwrap_or(15);
-        self.lookup_min = min.unwrap_or(0.0);
+        self.lookup_min = min;
         self
     }
 

@@ -15,8 +15,9 @@ const USAGE: &str = "usage:
   g2048 positions OUT_FILE [count=64] --net FILE [--depth 2] [--rank 14]   (boards where the tile first appears)
   g2048 endgame POS_FILE --net FILE [--depth N] [--cprob P] [LOOKUP]       (play saved boards to the end)
   g2048 formation POS_FILE [--layouts L]                        (which endgame layouts the boards fit)
-    LOOKUP: --tables DIR [--layouts block10,five7] [--lookup-rank 15] [--lookup-min 0]
-            exact endgame tables (macroxue style), filled on first use and saved in DIR
+    LOOKUP: --tables DIR [--layouts block10,five7] [--lookup-rank 15] [--lookup-min P]
+            exact endgame tables (macroxue style), filled on first use and saved in DIR;
+            five8 needs about 9 GB of RAM, five9 (macroxue's 2022 table) about 33 GB
             --endgame-eval mx [--endgame-rank 15] [--endgame-depth 3]: from a board holding
             that rank, play like macroxue (its evaluation and depth) instead of the net
   g2048 serve --net FILE [--depth N] [--port 20480]
@@ -307,7 +308,7 @@ fn probe(args: &[String]) {
     let boards = read_boards(&file);
     let lk = lookup(args).unwrap_or_else(|| panic!("probe needs --tables DIR"));
     for b in boards {
-        match lk.suggest(b, -1.0) {
+        match lk.suggest(b, Some(-1.0)) {
             Some((d, p)) => println!("{b:016x} {} {p:.4}", format!("{d:?}").to_lowercase()),
             None => println!("{b:016x} - -"),
         }

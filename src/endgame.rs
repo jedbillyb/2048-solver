@@ -97,14 +97,17 @@ impl Layout {
     }
 
     /// `block10`, `five7`, `snake8`: the kind and its largest exact anchor rank. The lower
-    /// bounds keep every spawned 4 inside the rules; the upper ones keep the canonical
-    /// anchors inside a nibble.
+    /// bounds keep every spawned 4 inside the rules. `block`'s anchor rank is the smallest
+    /// anchor itself, so its cap is bound by the nibble; `five` and `snake` cap the anchor
+    /// rank separately, as macroxue does, so they go as far as the canonical anchors allow.
+    /// Memory: `five7` 2.4 GB of address space, `five8` 11 GB, `five9` (macroxue's 2022
+    /// table) 44 GB, of which about three quarters get touched.
     pub fn parse(name: &str) -> Option<Layout> {
         let (kind, top) = name.split_at(name.find(|c: char| c.is_ascii_digit())?);
         let top: u8 = top.parse().ok()?;
         match kind {
             "block" if (5..=10).contains(&top) => Some(Layout::block(top)),
-            "five" if (4..=7).contains(&top) => Some(Layout::five(top)),
+            "five" if (4..=9).contains(&top) => Some(Layout::five(top)),
             "snake" if (4..=8).contains(&top) => Some(Layout::snake(top)),
             _ => None,
         }
@@ -119,10 +122,15 @@ impl Layout {
         format!("{kind}{}", self.top)
     }
 
-    /// macroxue follows the five-anchor table only when it is nearly sure (0.9); the
-    /// others whenever they see any way to the goal.
+    /// macroxue follows the small five-anchor table only when it is nearly sure (0.9),
+    /// the big one (cap 8 and up) above 0.1, and the others whenever they see any way to
+    /// the goal.
     pub fn threshold(&self) -> f32 {
-        if self.kind == Kind::Five { 0.9 } else { 0.0 }
+        match self.kind {
+            Kind::Five if self.top >= 8 => 0.1,
+            Kind::Five => 0.9,
+            _ => 0.0,
+        }
     }
 
     pub fn entries(&self) -> usize {
@@ -139,15 +147,14 @@ impl Layout {
         v
     }
 
-    /// Anchors as the table knows them: a descending staircase whose smallest step makes
-    /// the anchor rank `top`.
+    /// Anchors as the table knows them: a descending staircase from 15, except that a
+    /// block's smallest anchor is `top`, because there the anchor rank is that tile itself
+    /// rather than `min(top, ..)`.
     fn prefill(&self, g: &mut Grid) {
-        let mut r = self.top
-            + match self.kind {
-                Kind::Block => 5,
-                Kind::Snake => 7,
-                Kind::Five => 8,
-            };
+        let mut r = match self.kind {
+            Kind::Block => self.top + 5,
+            Kind::Snake | Kind::Five => 15,
+        };
         for c in 0..16 {
             if self.caps[c] == 1 {
                 g[c] = r;
@@ -476,15 +483,16 @@ impl Lookup {
     }
 
     /// The move with the best goal probability over all tables and orientations, if any
-    /// table applies and the probability is above `min`.
-    pub fn suggest(&self, b: Board, min: f32) -> Option<(Dir, f32)> {
+    /// table applies and the probability is above `min` (or, with None, above the
+    /// table's own threshold).
+    pub fn suggest(&self, b: Board, min: Option<f32>) -> Option<(Dir, f32)> {
         self.asked.fetch_add(1, Relaxed);
         let mut best: Option<(Dir, f32)> = None;
         for table in &self.tables {
             for s in 0..8 {
                 let tb = transform(b, s);
                 let Some((m, p)) = table.advice(&self.t, tb) else { continue };
-                if p <= min.max(table.layout.threshold()) || best.is_some_and(|(_, bp)| p <= bp) {
+                if p <= min.unwrap_or(table.layout.threshold()) || best.is_some_and(|(_, bp)| p <= bp) {
                     continue;
                 }
                 // Back to the board's own orientation: the direction whose result is the
@@ -516,7 +524,8 @@ mod tests {
         assert_eq!(Layout::snake(8).entries(), 9 * 8 * 8 * 8 * 8 * 7 * 7 * 7 * 7); // Snake9
         assert_eq!(Layout::five(7).entries(), 7 * 8 * 7 * 7 * 7 * 7 * 7 * 6 * 6 * 6 * 6); // Tuple11 (small)
         assert_eq!(Layout::parse("five7").map(|l| l.caps[6]), Some(8));
-        assert!(Layout::parse("block11").is_none() && Layout::parse("five8").is_none());
+        assert_eq!(Layout::five(9).entries(), 9 * 10 * 9 * 9 * 9 * 9 * 9 * 8 * 8 * 8 * 8); // Tuple11 (BIG_TUPLES)
+        assert!(Layout::parse("block11").is_none() && Layout::parse("five10").is_none());
         assert_eq!(Layout::parse("block10").map(|l| l.name()), Some("block10".into()));
         assert_eq!(Layout::parse("snake8").map(|l| l.caps[7]), Some(9));
         assert!(Layout::parse("tower5").is_none());
@@ -524,10 +533,15 @@ mod tests {
 
     #[test]
     fn canonical_anchors_are_regular_and_in_caps() {
-        for l in [Layout::block(10), Layout::block(6), Layout::snake(8), Layout::snake(5), Layout::five(7), Layout::five(4)] {
+        for l in [Layout::block(10), Layout::block(6), Layout::snake(8), Layout::snake(5), Layout::five(9), Layout::five(7), Layout::five(4)] {
             let mut g = [0u8; 16];
             l.prefill(&mut g);
             assert!(l.regular(&g) && !l.goal(&g), "{}", l.name());
+            // five and snake anchors are macroxue's 15 downwards whatever the cap, so the
+            // existing five7 and snake8 files stay valid.
+            if l.kind != Kind::Block {
+                assert_eq!(g[0], 15);
+            }
             // The largest free values the rules allow fit the caps.
             let k = l.anchor(&g);
             assert_eq!(k, l.top as i32);
@@ -577,16 +591,16 @@ mod tests {
         // A board whose only free tile cannot move without dragging the anchors is lost:
         // the table says so with probability 0, and the search keeps the move.
         let stuck = grid([[10, 9, 8, 0], [7, 6, 5, 0], [1, 0, 0, 0], [0, 0, 0, 0]]);
-        assert_eq!(lk.suggest(stuck, 0.0), None);
+        assert_eq!(lk.suggest(stuck, None), None);
         let b = grid([[10, 9, 8, 1], [7, 6, 5, 0], [1, 0, 2, 0], [0, 1, 0, 0]]);
-        let (d, p) = lk.suggest(b, 0.0).expect("advice");
+        let (d, p) = lk.suggest(b, None).expect("advice");
         assert!(p > 0.0 && p <= 1.0, "p = {p}");
         let table = &lk.tables()[0];
         assert!(table.computed() > 100);
         // Every orientation of the board gets the same probability and the matching move.
         for s in 1..8 {
             let tb = transform(b, s);
-            let (td, tp) = lk.suggest(tb, 0.0).expect("advice");
+            let (td, tp) = lk.suggest(tb, None).expect("advice");
             assert!((tp - p).abs() < 1e-4);
             assert_eq!(transform(lk.t.apply(b, d).0, s), lk.t.apply(tb, td).0);
         }
@@ -596,7 +610,7 @@ mod tests {
         lk.save().unwrap();
         let again = Lookup::open(&dir, &[Layout::block(5)]).unwrap();
         assert_eq!(again.tables()[0].computed(), table.computed());
-        assert_eq!(again.suggest(b, 0.0), Some((d, p)));
+        assert_eq!(again.suggest(b, None), Some((d, p)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
