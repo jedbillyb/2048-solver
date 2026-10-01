@@ -240,7 +240,7 @@ impl Ai {
             self.endgame_depth.unwrap_or(3)
         } else {
             match (self.endgame_depth, self.depth) {
-                (Some(e), _) if max_rank(b) >= 14 => e,
+                (Some(e), _) if !self.endgame_eval && max_rank(b) >= 14 => e,
                 (_, Some(d)) => d,
                 _ => distinct_tiles(b).saturating_sub(2).max(3),
             }
