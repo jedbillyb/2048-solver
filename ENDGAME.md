@@ -280,13 +280,6 @@ Fresh games, `bench 600 201`, same seeds throughout (2026-10-01):
 | macroxue from 16384, depth 3 | 2 | 41.5% | 451k | |
 | macroxue from 16384, depth 5 | running | | | |
 
-Caveat on the depth-4 and depth-5 rows: until 18512ca, `--endgame-depth` also raised the
-net's own depth from 16384 on (its older meaning), so those runs played 16384 to 32768
-with the net at depth 4 or 5, not at depth 2. Their 65536 counts are still macroxue's
-conversions from the handover point, but the mean scores and the time include a deeper
-net phase, and the rows should be re-run after the fix before being compared with later
-settings.
-
 65536 is reached: about one fresh game in 80, from none. Given a 32768 the conversion
 is about 2.2% (8 of roughly 360), against 3.6% for macroxue's own program at depth 5
 from boards it shaped itself. The 16384 handover at depth 3 shows the transfer penalty
@@ -300,9 +293,10 @@ the net's boards only 41.5%.
    `five9` now parse: the five and snake layouts place their canonical anchors at 15
    downwards whatever the cap, as macroxue does, so the existing `five7` and `snake8`
    files stay valid. Memory of address space, of which about three quarters get touched:
-   `five7` 2.4 GB, `five8` 11 GB (about 9 GB resident), `five9` 44 GB (about 33 GB). With
-   the laptop at 13.5 GB and OCI at 23.4 GB less 7 GB for the coordinator, `five8` fits
-   on either with training stopped on the laptop; `five9` fits nowhere here.
+   `five7` 2.4 GB, `five8` 11 GB (about 9 GB resident), `five9` 44 GB (about 33 GB).
+   `five8` with `block10` is about 12 GB resident plus the net: too much for the laptop
+   (13.5 GB with the OS), fine on OCI (23.4 GB, 7 GB of it the coordinator) with its
+   training worker paused for the hour the run takes; `five9` fits nowhere here.
 
    ```sh
    # conversion from the fixed boards, then fresh games; first run builds five8 (minutes)
