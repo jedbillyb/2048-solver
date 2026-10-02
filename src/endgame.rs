@@ -19,18 +19,18 @@ use std::sync::atomic::{AtomicU16, AtomicU64, Ordering::Relaxed};
 type Grid = [u8; 16];
 
 fn to_grid(b: Board) -> Grid {
-    std::array::from_fn(|i| ((b >> (4 * i)) & 0xF) as u8)
+    std::array::from_fn(|i| ((b >> (5 * i)) & 0x1F) as u8)
 }
 
 fn from_grid(g: &Grid) -> Board {
-    g.iter().enumerate().fold(0, |b, (i, &r)| b | (r as Board) << (4 * i))
+    g.iter().enumerate().fold(0, |b, (i, &r)| b | (r as Board) << (5 * i))
 }
 
 /// The board under symmetry `s` (0 = identity, 1..3 rotations, 4..7 their mirrors).
 pub fn transform(b: Board, s: usize) -> Board {
     let mut out = 0;
     for c in 0..16 {
-        out |= ((b >> (4 * c)) & 0xF) << (4 * symmetries(c)[s]);
+        out |= ((b >> (5 * c)) & 0x1F) << (5 * symmetries(c)[s]);
     }
     out
 }
@@ -333,9 +333,9 @@ impl Table {
     fn try_tiles(&self, t: &Tables, b: Board) -> f32 {
         let (mut p, mut n) = (0.0, 0);
         for i in 0..16 {
-            if (b >> (4 * i)) & 0xF == 0 {
+            if (b >> (5 * i)) & 0x1F == 0 {
                 n += 1;
-                p += 0.9 * self.try_moves(t, b | 1 << (4 * i)) + 0.1 * self.try_moves(t, b | 2 << (4 * i));
+                p += 0.9 * self.try_moves(t, b | 1 << (5 * i)) + 0.1 * self.try_moves(t, b | 2 << (5 * i));
             }
         }
         if n == 0 { 0.0 } else { p / n as f32 }

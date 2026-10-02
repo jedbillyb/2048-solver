@@ -152,13 +152,16 @@ impl NTuple {
     #[inline]
     fn indices(&self, b: Board, out: &mut [usize; 8 * MAX_TUPLES]) -> usize {
         let base = self.stage(b) * self.stage_size();
-        let b = downgrade(b);
+        // The net only ever sees abstracted boards (max rank 14), so each cell still fits
+        // four bits and the weight tables keep their 16^L layout. The board is 5 bits per
+        // cell, so read at 5*c but index at 4 bits.
+        let b = abstract_board(b);
         let mut n = 0;
         for (t, syms) in self.cells.iter().enumerate() {
             for s in syms {
                 let mut idx = 0usize;
                 for &c in s {
-                    idx = (idx << 4) | ((b >> (4 * c)) & 0xF) as usize;
+                    idx = (idx << 4) | ((b >> (5 * c)) & 0xF) as usize;
                 }
                 out[n] = base + t * TUPLE_SIZE + idx;
                 n += 1;
@@ -298,24 +301,41 @@ impl NTuple {
 /// the fresh 32768 (whose 16384 just merged away) into a familiar 16384 position.
 #[inline]
 pub fn downgrade(b: Board) -> Board {
-    if max_rank(b) < 15 {
+    let max = max_rank(b) as u32;
+    if max < 15 {
         return b;
     }
     let mut present = 0u32;
     for i in 0..16 {
-        present |= 1 << ((b >> (4 * i)) & 0xF);
+        present |= 1 << ((b >> (5 * i)) & 0x1F);
     }
-    let missing = match (1..15u32).rev().find(|r| present & (1 << r) == 0) {
+    let missing = match (1..max).rev().find(|r| present & (1 << r) == 0) {
         Some(m) => m,
         None => return b,
     };
-    let mut out = 0u64;
+    let mut out = 0u128;
     for i in 0..16 {
-        let r = (b >> (4 * i)) & 0xF;
-        let r = if r as u32 > missing { r - 1 } else { r };
-        out |= r << (4 * i);
+        let r = ((b >> (5 * i)) & 0x1F) as u32;
+        let r = if r > missing { r - 1 } else { r };
+        out |= (r as u128) << (5 * i);
     }
     out
+}
+
+/// What the net evaluates: a board downgraded repeatedly until its largest tile is rank
+/// 14, so a 32768 board collapses one step (today's warm start) and a 65536 board two.
+/// Keeps every existing net weight valid once the board can hold tiles above 32768.
+#[inline]
+pub fn abstract_board(b: Board) -> Board {
+    let mut b = b;
+    while max_rank(b) > 14 {
+        let d = downgrade(b);
+        if d == b {
+            break;
+        }
+        b = d;
+    }
+    b
 }
 
 /// The chain state of a board, the unit the restart pool is keyed by. `max` is the rank
@@ -325,11 +345,11 @@ pub fn downgrade(b: Board) -> Board {
 /// floor, merge into it, the floor rises and the free tiles start small again. Boards
 /// below 16384 have no key; fresh play covers them.
 pub fn pool_key(b: Board) -> Option<u16> {
-    let mut count = [0u8; 16];
+    let mut count = [0u8; 18];
     for i in 0..16 {
-        count[((b >> (4 * i)) & 0xF) as usize] += 1;
+        count[((b >> (5 * i)) & 0x1F) as usize] += 1;
     }
-    let max = (1..16).rev().find(|&r| count[r] > 0)?;
+    let max = (1..18).rev().find(|&r| count[r] > 0)?;
     if max < 14 {
         return None;
     }
@@ -477,12 +497,12 @@ impl Pool {
         self.dirty.load(Relaxed) > 0
     }
 
-    /// Wire and file format: magic, u8 bytes per board (8), u32 keys, then per key
-    /// u16 key, u64 seen, u32 count, the boards.
+    /// Wire and file format: magic, u8 bytes per board (16), u32 keys, then per key
+    /// u16 key, u64 seen, u32 count, the boards (u128, so tiles above 32768 fit).
     pub fn encode(entries: &[PoolEntry]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend(POOL_MAGIC);
-        out.push(8);
+        out.push(16);
         out.extend((entries.len() as u32).to_le_bytes());
         for (k, seen, boards) in entries {
             out.extend(k.to_le_bytes());
@@ -502,20 +522,20 @@ impl Pool {
             at += n;
             Some(s)
         };
-        if take(4)? != POOL_MAGIC || take(1)? != [8] {
+        if take(4)? != POOL_MAGIC || take(1)? != [16] {
             return None;
         }
         // Counts come off the wire: never reserve more than the bytes could hold (a key
-        // entry is at least 14 bytes, a board 8), so a corrupt body cannot abort the process.
+        // entry is at least 14 bytes, a board 16), so a corrupt body cannot abort the process.
         let nkeys = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
         let mut out = Vec::with_capacity(nkeys.min(bytes.len() / 14));
         for _ in 0..nkeys {
             let key = u16::from_le_bytes(take(2)?.try_into().ok()?);
             let seen = u64::from_le_bytes(take(8)?.try_into().ok()?);
             let n = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
-            let mut boards = Vec::with_capacity(n.min(bytes.len() / 8));
+            let mut boards = Vec::with_capacity(n.min(bytes.len() / 16));
             for _ in 0..n {
-                boards.push(u64::from_le_bytes(take(8)?.try_into().ok()?));
+                boards.push(u128::from_le_bytes(take(16)?.try_into().ok()?));
             }
             out.push((key, seen, boards));
         }
@@ -548,7 +568,7 @@ impl Pool {
 
 pub struct EpisodeStats {
     pub score: u64,
-    /// 16 when two 32768s merged: the board cannot hold a 65536, so the game ends there.
+    /// Largest tile rank the episode reached (16 is 65536, 17 is 131072).
     pub max_rank: u8,
     /// False when the episode started from a restart-pool board.
     pub fresh: bool,
@@ -597,16 +617,9 @@ pub fn train_episode(net: &NTuple, t: &Tables, rng: &mut Rng, alpha: f32, pool: 
             }
             Some((after, r, v)) => {
                 score += r as u64;
-                if top == 15 && made_65536(b, after) {
-                    // The 65536 does not fit a nibble, so the game ends here. The merge
-                    // leaves it stored as a 32768 (tile downgrading), so `v` is its 65536
-                    // points plus a fresh-32768 board's value: learn it, or the reward for
-                    // the one merge stage 3 exists to teach never reaches the net.
-                    if let Some(p) = prev_after {
-                        net.update(p, alpha, v - net.value(p));
-                    }
-                    return EpisodeStats { score, max_rank: 16, fresh, start_rank };
-                }
+                // On the u128 board a 65536 (and a 131072) is an ordinary tile that stays
+                // after the merge, so the episode plays on. The merge reward is in `v`, so
+                // the normal TD update below teaches the transition stage 3/4 exist for.
                 if let Some(p) = prev_after {
                     net.update(p, alpha, v - net.value(p));
                 }
@@ -672,7 +685,7 @@ mod tests {
         for _ in 0..50 {
             train_episode(&net, &t, &mut rng, 0.01, &pool, 0.0, 1);
         }
-        let b: Board = 0x0000_0012_0341_1235;
+        let b = grid([[5, 3, 2, 1], [1, 4, 3, 0], [2, 1, 0, 0], [0, 0, 0, 0]]);
         let v = net.value(b);
         assert!((net.value(transpose(b)) - v).abs() < 1e-2 * v.abs().max(1.0));
     }
@@ -694,17 +707,21 @@ mod tests {
     #[test]
     fn downgrade_turns_fresh_32768_into_16384() {
         // 32768, 8192, 4096 and a 2: no 16384 left, so 32768 -> 16384 and nothing else moves.
-        let b: Board = 0x0000_0000_1000_CDF0;
-        assert_eq!(downgrade(b), 0x0000_0000_1000_CDE0);
-        // Boards without 32768 are untouched.
-        assert_eq!(downgrade(0x0000_0000_1000_CDE0), 0x0000_0000_1000_CDE0);
+        let b = grid([[15, 13, 12, 1], [0; 4], [0; 4], [0; 4]]);
+        assert_eq!(downgrade(b), grid([[14, 13, 12, 1], [0; 4], [0; 4], [0; 4]]));
+        // Boards below 32768 are untouched.
+        let lower = grid([[14, 13, 12, 1], [0; 4], [0; 4], [0; 4]]);
+        assert_eq!(downgrade(lower), lower);
+        // A 65536 board abstracts two steps down to a rank-14 board.
+        let big = grid([[16, 14, 13, 1], [0; 4], [0; 4], [0; 4]]);
+        assert_eq!(max_rank(abstract_board(big)), 14);
     }
 
     fn grid(g: [[u8; 4]; 4]) -> Board {
-        let mut b = 0;
+        let mut b = 0u128;
         for r in 0..4 {
             for c in 0..4 {
-                b |= (g[r][c] as u64) << (4 * (4 * r + c));
+                b |= (g[r][c] as u128) << (5 * (4 * r + c));
             }
         }
         b
@@ -769,7 +786,7 @@ mod tests {
         let k1 = pool_key(grid([[14, 1, 0, 0], [0; 4], [0; 4], [0; 4]])).unwrap();
         let k2 = pool_key(grid([[15, 1, 0, 0], [0; 4], [0; 4], [0; 4]])).unwrap();
         for i in 0..20u64 {
-            pool.add(k1, 0xE000_0000_0000_0000 | i, &mut rng);
+            pool.add(k1, 0xE000_0000_0000_0000u128 | i as u128, &mut rng);
         }
         pool.add(k2, 0xF000_0000_0000_0001, &mut rng);
         assert_eq!(pool.summary().iter().find(|e| e.0 == k1).map(|e| (e.1, e.2)), Some((5, 20)));
@@ -789,10 +806,10 @@ mod tests {
         assert_eq!(Pool::decode(&Pool::encode(&out)).unwrap(), out);
         assert_eq!(Pool::decode(b"nope"), None);
         // A header claiming billions of keys or boards must fail, not reserve memory.
-        let mut huge = b"POL1\x08".to_vec();
+        let mut huge = b"POL1\x10".to_vec();
         huge.extend(u32::MAX.to_le_bytes());
         assert_eq!(Pool::decode(&huge), None);
-        let mut huge = b"POL1\x08\x01\0\0\0".to_vec();
+        let mut huge = b"POL1\x10\x01\0\0\0".to_vec();
         huge.extend([0u8; 10]);
         huge.extend(u32::MAX.to_le_bytes());
         assert_eq!(Pool::decode(&huge), None);
@@ -807,8 +824,9 @@ mod tests {
     }
 
     #[test]
-    fn episode_ends_when_65536_is_made() {
-        // Only left and right are legal, and both merge the two 32768s.
+    fn episode_continues_past_65536() {
+        // Only left and right are legal, and both merge the two 32768s into a 65536. On the
+        // u128 board that tile fits, so the episode plays on rather than ending at the merge.
         let net = NTuple::new(0.0, 1, &TUPLES_4);
         let t = Tables::new();
         let pool = Pool::new(10);
@@ -818,10 +836,14 @@ mod tests {
         pool.add(k, b, &mut rng);
         let e = train_episode(&net, &t, &mut rng, 0.01, &pool, 1.0, 2);
         assert!(!e.fresh);
-        assert_eq!((e.max_rank, e.start_rank, e.score), (16, 15, 65536));
+        assert_eq!(e.start_rank, 15);
+        assert!(e.max_rank >= 16, "reached a 65536");
+        assert!(e.score >= 65536);
         assert!(e.progressed());
-        // The restart stage filter keeps a stage-1 pool from feeding stage-2 restarts.
-        let e = train_episode(&net, &t, &mut rng, 0.01, &pool, 1.0, 3);
+        // The restart stage filter keeps a stage-2 pool from feeding stage-3 restarts.
+        let pool2 = Pool::new(10);
+        pool2.add(k, b, &mut rng);
+        let e = train_episode(&net, &t, &mut rng, 0.01, &pool2, 1.0, 3);
         assert!(e.fresh);
     }
 
@@ -829,10 +851,10 @@ mod tests {
     fn stages_split_on_big_tiles() {
         let mut net = NTuple::new(0.0, 1, &TUPLES_4);
         net.expand_stages(3);
-        assert_eq!(net.stage(0x0000_0000_0000_00D1), 0); // 8192
-        assert_eq!(net.stage(0x0000_0000_0000_00E1), 1); // 16384
-        assert_eq!(net.stage(0x0000_0000_0000_00F1), 2); // 32768
+        assert_eq!(net.stage(grid([[1, 13, 0, 0], [0; 4], [0; 4], [0; 4]])), 0); // 8192
+        assert_eq!(net.stage(grid([[1, 14, 0, 0], [0; 4], [0; 4], [0; 4]])), 1); // 16384
+        assert_eq!(net.stage(grid([[1, 15, 0, 0], [0; 4], [0; 4], [0; 4]])), 2); // 32768
         let one = NTuple::new(0.0, 1, &TUPLES_4);
-        assert_eq!(one.stage(0x0000_0000_0000_00F1), 0);
+        assert_eq!(one.stage(grid([[1, 15, 0, 0], [0; 4], [0; 4], [0; 4]])), 0);
     }
 }

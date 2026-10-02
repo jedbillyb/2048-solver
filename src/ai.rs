@@ -373,10 +373,10 @@ mod tests {
     use crate::ntuple::{NTuple, TUPLES_4};
 
     fn grid(g: [[u8; 4]; 4]) -> Board {
-        let mut b = 0;
+        let mut b = 0u128;
         for r in 0..4 {
             for c in 0..4 {
-                b |= (g[r][c] as u64) << (4 * (4 * r + c));
+                b |= (g[r][c] as u128) << (5 * (4 * r + c));
             }
         }
         b

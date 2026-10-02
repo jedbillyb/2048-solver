@@ -31,8 +31,10 @@ struct GameResult {
     score: u64,
     max_rank: u8,
     moves: u64,
-    /// Two 32768s merged. The game stops there: that's the goal.
+    /// A 65536 was made at some point in the game.
     won_65536: bool,
+    /// A 131072 was made: the win, and the game stops there.
+    won_131072: bool,
 }
 
 fn flag<T: std::str::FromStr>(args: &[String], name: &str) -> Option<T> {
@@ -60,13 +62,15 @@ fn threads(cap: u64) -> usize {
 fn play(ai: &ai::Ai, seed: u64) -> GameResult {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let mut b = spawn(spawn(0, &mut rng), &mut rng);
-    let (mut score, mut moves, mut won_65536) = (0u64, 0u64, false);
+    let (mut score, mut moves, mut won_65536, mut won_131072) = (0u64, 0u64, false, false);
     while let Some(d) = ai.best_move(b) {
         let (nb, s) = ai.tables().apply(b, d);
         score += s as u64;
         moves += 1;
-        if made_65536(b, nb) {
-            won_65536 = true;
+        won_65536 |= made_65536(b, nb);
+        if made_131072(b, nb) {
+            // 131072 is the largest tile a 4x4 board can hold: the win, so stop here.
+            won_131072 = true;
             b = nb;
             break;
         }
@@ -75,7 +79,7 @@ fn play(ai: &ai::Ai, seed: u64) -> GameResult {
     if std::env::var_os("G2048_SHOW_END").is_some() {
         eprintln!("final board (score {score}):\n{}", board::print(b));
     }
-    GameResult { score, max_rank: max_rank(b), moves, won_65536 }
+    GameResult { score, max_rank: max_rank(b), moves, won_65536, won_131072 }
 }
 
 fn report(results: &[GameResult], secs: f64, threads: usize) {
@@ -89,8 +93,10 @@ fn report(results: &[GameResult], secs: f64, threads: usize) {
         let hit = results.iter().filter(|r| r.max_rank >= k).count();
         println!("reached {:>5}: {:>5.1}%", 1u32 << k, 100.0 * hit as f64 / n);
     }
-    let won = results.iter().filter(|r| r.won_65536).count();
+    let won = results.iter().filter(|r| r.won_65536 || r.max_rank >= 16).count();
     println!("reached 65536: {:>5.1}%", 100.0 * won as f64 / n);
+    let won_big = results.iter().filter(|r| r.won_131072 || r.max_rank >= 17).count();
+    println!("reached 131072: {:>4.2}%", 100.0 * won_big as f64 / n);
 }
 
 /// Endgame tables from --tables DIR and --layouts, or None without --tables.
@@ -188,17 +194,53 @@ fn positions(args: &[String]) {
         None
     });
     let boards: Vec<Board> = found.into_iter().flatten().take(count as usize).collect();
-    let text: String = boards.iter().map(|b| format!("{b:016x}\n")).collect();
+    let text: String = boards.iter().map(|b| format!("{}\n", board_to_str(*b))).collect();
     std::fs::write(&out, text).expect("writing positions");
     println!("saved {} boards to {out}", boards.len());
 }
 
-/// Boards from a positions file: the first word of each line, 16 hex ranks.
+/// A board on one line of a positions file. Boards with no tile above 32768 use the old
+/// 16-hex-digit u64 form, so files interchange with the u64 build and with pos32k.txt.
+/// Boards holding a 65536 or 131072 use one radix-32 char per cell (cell 0 first), the
+/// only form that can carry ranks above 15.
+fn board_to_str(b: Board) -> String {
+    if max_rank(b) <= 15 {
+        let mut n = 0u64;
+        for i in 0..16 {
+            n |= (((b >> (5 * i)) & 0x1F) as u64) << (4 * i);
+        }
+        format!("{n:016x}")
+    } else {
+        (0..16).map(|i| std::char::from_digit(((b >> (5 * i)) & 0x1F) as u32, 32).unwrap()).collect()
+    }
+}
+
+fn parse_file_board(tok: &str) -> Option<Board> {
+    if tok.len() != 16 {
+        return None;
+    }
+    if tok.bytes().all(|c| c.is_ascii_hexdigit()) {
+        let n = u64::from_str_radix(tok, 16).ok()?;
+        let mut b = 0u128;
+        for i in 0..16 {
+            b |= (((n >> (4 * i)) & 0xF) as u128) << (5 * i);
+        }
+        Some(b)
+    } else {
+        let mut b = 0u128;
+        for (i, ch) in tok.chars().enumerate() {
+            b |= (ch.to_digit(32)? as u128) << (5 * i);
+        }
+        Some(b)
+    }
+}
+
+/// Boards from a positions file: the first word of each line (see `board_to_str`).
 fn read_boards(file: &str) -> Vec<Board> {
     std::fs::read_to_string(file)
         .unwrap_or_else(|e| panic!("reading {file}: {e}"))
         .lines()
-        .filter_map(|l| u64::from_str_radix(l.split_whitespace().next()?, 16).ok())
+        .filter_map(|l| parse_file_board(l.split_whitespace().next()?))
         .collect()
 }
 
@@ -450,7 +492,7 @@ fn parse_board(hex: &str) -> Option<Board> {
     if hex.len() != 16 {
         return None;
     }
-    hex.chars().enumerate().try_fold(0u64, |b, (i, ch)| Some(b | (ch.to_digit(16)? as u64) << (4 * i)))
+    hex.chars().enumerate().try_fold(0u128, |b, (i, ch)| Some(b | (ch.to_digit(16)? as u128) << (5 * i)))
 }
 
 /// Tiny HTTP server for the browser bot: GET /move?b=<16 hex ranks> -> "up" | "down" | "left" | "right" | "none".
