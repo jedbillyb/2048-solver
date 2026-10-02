@@ -321,3 +321,33 @@ games.
 Measuring: 7 against 8 cannot be read. For conversions use `pos32k.txt` (1000 attempts);
 for the overall rate and mean score, the fresh-game bench, and 1200 games (`bench 1200
 201`) once two settings are within a few counts of each other.
+
+## 9. The bigger table and pass_score, measured (2026-10-02)
+
+Levers 1 and 2 are settled. The `five8` table and macroxue's `pass_score` cut both help,
+and together they are the best setting on this u64 branch.
+
+`pass_score` (`--pass-score small|big`, commit ce0249b) is macroxue's cut after the
+handover: a chance node whose static value is below twice the largest tile's cost is
+scored without expanding it, so the search spends its depth on the lines that matter.
+`big` is the BIG_TUPLES variant. It also runs the handed-over phase far faster, so a
+given run finishes in a fraction of the time.
+
+Conversions, 1000 fixed first-32768 boards (`pos32k.txt`), depth-5 macroxue handover:
+
+| 1000 boards (pos32k) | 65536 | time |
+|---|---|---|
+| block10 + five7 | 19 (1.9%) | |
+| block10 + five8 | 22 (2.2%) | 4545s |
+| block10 + five8, `--pass-score big` | 27 (2.7%) | 1394s |
+
+Fresh games, `bench 600 201`, rank-14 depth-5 handover, block10 + five8:
+
+| 600 fresh games | 32768 | 65536 | mean score | time |
+|---|---|---|---|---|
+| no pass_score | 65.3% | 8 (1.3%) | 598,065 | 27 min |
+| `--pass-score big` | 66.7% | 11 (1.8%) | 602,529 | 35 min |
+
+`--pass-score big` wins on all three: 32768 rate, 65536 count, and mean score. It is the
+best full-game setting so far. The remaining u64 lever is depth 6 (lever 3 above). The
+131072 end goal is gated on Release B (u128 board) and stage 4, not on these knobs.
