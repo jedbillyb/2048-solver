@@ -153,15 +153,17 @@ impl NTuple {
     fn indices(&self, b: Board, out: &mut [usize; 8 * MAX_TUPLES]) -> usize {
         let base = self.stage(b) * self.stage_size();
         // The net only ever sees abstracted boards (max rank 14), so each cell still fits
-        // four bits and the weight tables keep their 16^L layout. The board is 5 bits per
-        // cell, so read at 5*c but index at 4 bits.
-        let b = abstract_board(b);
+        // four bits and the weight tables keep their 16^L layout. Unpack the 5-bit cells
+        // into an array once, so the tuple loops index that rather than shifting the u128
+        // afresh for every cell of every symmetry (the training hot path).
+        let ab = abstract_board(b);
+        let cells: [usize; 16] = std::array::from_fn(|i| ((ab >> (5 * i)) & 0xF) as usize);
         let mut n = 0;
         for (t, syms) in self.cells.iter().enumerate() {
             for s in syms {
                 let mut idx = 0usize;
                 for &c in s {
-                    idx = (idx << 4) | ((b >> (5 * c)) & 0xF) as usize;
+                    idx = (idx << 4) | cells[c];
                 }
                 out[n] = base + t * TUPLE_SIZE + idx;
                 n += 1;
