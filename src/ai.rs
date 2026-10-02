@@ -21,9 +21,9 @@ const EMPTY_W: f32 = 270.0;
 /// macroxue/2048-ai's line score: T(r) = r * 2^r per tile, a bonus for each pair that
 /// descends left to right and a steep penalty for each that ascends, so big tiles are
 /// pushed to the top-left corner. Rows and columns are summed in that one orientation.
-fn mx_line(row: u16) -> f32 {
+fn mx_line(row: u32) -> f32 {
     let ts = |c: usize| {
-        let r = ((row >> (4 * c)) & 0xF) as i64;
+        let r = ((row >> (5 * c)) & 0x1F) as i64;
         (r << r) as f32
     };
     let mut score = ts(0);
@@ -112,8 +112,8 @@ struct Search<'a> {
     tt: HashMap<Board, (u32, f32)>,
 }
 
-fn row_heur(row: u16) -> f32 {
-    let line: [u32; 4] = std::array::from_fn(|i| ((row >> (4 * i)) & 0xF) as u32);
+fn row_heur(row: u32) -> f32 {
+    let line: [u32; 4] = std::array::from_fn(|i| (row >> (5 * i)) & 0x1F);
     let (mut sum, mut empty, mut merges) = (0.0, 0.0, 0.0);
     let (mut prev, mut counter) = (0, 0);
     for &r in &line {
@@ -147,7 +147,7 @@ fn row_heur(row: u16) -> f32 {
 
 impl Ai {
     pub fn new() -> Self {
-        Ai { t: Tables::new(), heur: (0..=u16::MAX).map(row_heur).collect(), heuristic: Heuristic::Rows, net: None, depth: None, endgame_depth: None, cprob_thresh: CPROB_THRESH, top_bias: 0.0, lookup: None, lookup_rank: 15, lookup_min: None, endgame_eval: false, endgame_rank: 15, pass_score: None }
+        Ai { t: Tables::new(), heur: (0..(1u32 << 20)).map(row_heur).collect(), heuristic: Heuristic::Rows, net: None, depth: None, endgame_depth: None, cprob_thresh: CPROB_THRESH, top_bias: 0.0, lookup: None, lookup_rank: 15, lookup_min: None, endgame_eval: false, endgame_rank: 15, pass_score: None }
     }
 
     /// From boards holding a tile of `rank`, play like the heuristic player `h` (with the
@@ -170,7 +170,7 @@ impl Ai {
     pub fn with_heuristic(mut self, h: Heuristic) -> Self {
         if h != self.heuristic {
             self.heuristic = h;
-            self.heur = (0..=u16::MAX).map(if h == Heuristic::Macroxue { mx_line } else { row_heur }).collect();
+            self.heur = (0..(1u32 << 20)).map(if h == Heuristic::Macroxue { mx_line } else { row_heur }).collect();
         }
         self
     }
@@ -248,7 +248,7 @@ impl Ai {
             let top = net.stages() > 1 && net.stage(b) == net.stages() - 1;
             return net.value(b) + if top { self.top_bias } else { 0.0 };
         }
-        let rows = |x: Board| (0..4).map(|r| self.heur[((x >> (16 * r)) & 0xFFFF) as usize]).sum::<f32>();
+        let rows = |x: Board| (0..4).map(|r| self.heur[((x >> (20 * r)) & 0xF_FFFF) as usize]).sum::<f32>();
         rows(b) + rows(transpose(b))
     }
 
@@ -343,9 +343,9 @@ impl Search<'_> {
         let cp = cprob / open as f32;
         let mut res = 0.0;
         for i in 0..16 {
-            if (b >> (4 * i)) & 0xF == 0 {
-                res += self.max(b | (1 << (4 * i)), cp * 0.9, depth) * 0.9;
-                res += self.max(b | (2 << (4 * i)), cp * 0.1, depth) * 0.1;
+            if (b >> (5 * i)) & 0x1F == 0 {
+                res += self.max(b | (1 << (5 * i)), cp * 0.9, depth) * 0.9;
+                res += self.max(b | (2 << (5 * i)), cp * 0.1, depth) * 0.1;
             }
         }
         res /= open as f32;
