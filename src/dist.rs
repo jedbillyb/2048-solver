@@ -1082,7 +1082,7 @@ fn machine_name() -> String {
 }
 
 /// Workers older than the job's `version=` restart into the new build on their own.
-const BUILD: u32 = 10;
+pub const BUILD: u32 = 10;
 pub const CHILD_ENV: &str = "G2048_WORKER_CHILD";
 /// The exit code a worker uses to ask its supervisor for the new build.
 const UPDATE_EXIT: i32 = 42;
@@ -1091,8 +1091,10 @@ const STOP_EXIT: i32 = 43;
 
 /// Runs the worker as a child process and restarts it when it exits: after a crash, or
 /// with the new build when the job asks for one. On Windows it first swaps in the exe the
-/// server publishes (a running exe can be renamed, not overwritten); elsewhere the binary
-/// on disk is already the new one.
+/// server publishes (a running exe can be renamed, not overwritten). On Linux it swaps in
+/// the published `g2048-linux-<arch>` when that is a newer build than the binary on disk,
+/// so machines that don't build from source (the OptiPlex) update themselves; machines
+/// that rebuild in place, or reach no /files/, keep the binary on disk.
 pub fn supervise(url: &str) {
     let exe = std::env::current_exe().expect("finding own exe");
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -1132,6 +1134,8 @@ pub fn supervise(url: &str) {
                         eprintln!("update failed, restarting the current version in 60s");
                         std::thread::sleep(Duration::from_secs(60));
                     }
+                } else {
+                    update_linux(&exe, url);
                 }
             }
             _ => {
@@ -1139,6 +1143,40 @@ pub fn supervise(url: &str) {
                 std::thread::sleep(Duration::from_secs(10));
             }
         }
+    }
+}
+
+/// The build number a g2048 binary reports with `g2048 build`, or 0 if it doesn't run.
+fn build_of(exe: &std::path::Path) -> u32 {
+    std::process::Command::new(exe)
+        .arg("build")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Downloads the published Linux build and renames it over `exe` (allowed while it runs)
+/// when it reports a newer build than the binary on disk.
+fn update_linux(exe: &std::path::Path, url: &str) {
+    let new = exe.with_extension("new");
+    let file = format!("{}/files/g2048-linux-{}", url.trim_end_matches('/'), std::env::consts::ARCH);
+    let got = std::process::Command::new("curl").args(["-sSf", "--connect-timeout", "20", "-o"]).arg(&new).arg(&file).status().is_ok_and(|s| s.success());
+    if !got {
+        let _ = std::fs::remove_file(&new);
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755));
+    }
+    let (have, offered) = (build_of(exe), build_of(&new));
+    if offered > have && std::fs::rename(&new, exe).is_ok() {
+        eprintln!("updated build {have} -> {offered}");
+    } else {
+        let _ = std::fs::remove_file(&new);
     }
 }
 
