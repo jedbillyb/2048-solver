@@ -422,6 +422,7 @@ fn token(args: &[String]) -> String {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("build") => println!("{}", dist::BUILD),
         Some("bench") => bench(&args[1..]),
         Some("train") => train(&args[1..]),
         Some("serve") => serve(&args[1..]),
