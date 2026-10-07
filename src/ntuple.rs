@@ -14,44 +14,51 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
 
-/// Cells are row-major, 0 = top-left. TUPLES_4 is Yeh's 4x6-tuple set; TUPLES_8 is
-/// Matsuzaki's 8x6-tuple set, the one behind the best published results (Guei et al. 2021).
-/// Saved files record their own tuples, so older nets with other shapes still load.
-pub const TUPLES_4: [[usize; 6]; 4] = [
-    [0, 1, 2, 3, 4, 5],
-    [4, 5, 6, 7, 8, 9],
-    [0, 1, 2, 4, 5, 6],
-    [4, 5, 6, 8, 9, 10],
+/// Cells are row-major, 0 = top-left. WIDTH is the cells per tuple: the published strong
+/// nets use 6 (Matsuzaki's 8x6 set, Guei et al. 2021). WIDTH=7 is the experimental
+/// larger-window net: each tuple sees one more cell, so the eval captures bigger patterns,
+/// at 16x the weights per tuple (16^7). The shapes below are connected 7-cell forms chosen
+/// for board coverage (extending the 6-cell idea); tune them if the larger window pays off.
+/// Saved files record WIDTH and their tuples, so a net only loads into a matching binary.
+pub const WIDTH: usize = 7;
+pub const TUPLES_4: [[usize; WIDTH]; 4] = [
+    [0, 1, 2, 3, 7, 6, 5],
+    [4, 5, 6, 7, 8, 9, 10],
+    [0, 1, 4, 5, 8, 9, 2],
+    [2, 3, 6, 7, 10, 11, 1],
 ];
-pub const TUPLES_8: [[usize; 6]; 8] = [
-    [0, 1, 2, 4, 5, 6],
-    [4, 5, 6, 7, 8, 9],
-    [0, 1, 2, 3, 4, 5],
-    [2, 3, 4, 5, 6, 9],
-    [0, 1, 2, 5, 9, 10],
-    [3, 4, 5, 6, 7, 8],
-    [1, 3, 4, 5, 6, 7],
-    [0, 1, 4, 8, 9, 10],
+pub const TUPLES_8: [[usize; WIDTH]; 8] = [
+    [0, 1, 2, 3, 7, 6, 5],
+    [4, 5, 6, 7, 8, 9, 10],
+    [0, 1, 4, 5, 8, 9, 2],
+    [2, 3, 6, 7, 10, 11, 1],
+    [8, 9, 10, 11, 12, 13, 14],
+    [0, 1, 2, 4, 5, 6, 9],
+    [1, 2, 5, 6, 9, 10, 13],
+    [3, 7, 6, 5, 11, 10, 9],
 ];
 const MAX_TUPLES: usize = 8;
-const TUPLE_SIZE: usize = 1 << 24;
+const TUPLE_SIZE: usize = 1 << (4 * WIDTH);
 /// Rank of the tile that opens stage 1 (16384); each rank above opens the next stage.
 const FIRST_STAGE_RANK: u8 = 14;
 const MAGIC_V1: &[u8; 8] = b"2048NT01";
 const MAGIC_V2: &[u8; 8] = b"2048NT02";
 const MAGIC_V3: &[u8; 8] = b"2048NT03";
+/// V4 records the tuple WIDTH after the tuple count, so a saved net only loads into a
+/// binary built with the same WIDTH (a 6-cell file will not load into a 7-cell binary).
+const MAGIC_V4: &[u8; 8] = b"2048NT04";
 
 pub struct NTuple {
     w: Vec<AtomicU32>,
     stages: usize,
-    tuples: Vec<[usize; 6]>,
+    tuples: Vec<[usize; WIDTH]>,
     /// Temporal coherence accumulators (sum of errors, sum of |errors|) per weight;
     /// empty unless TC learning is enabled.
     tc: Vec<(AtomicU32, AtomicU32)>,
     /// Stages below this one are left as they are by `update` (later stages train on their own).
     frozen: AtomicUsize,
     /// [tuple][symmetry] -> 6 cell indices
-    cells: Vec<[[usize; 6]; 8]>,
+    cells: Vec<[[usize; WIDTH]; 8]>,
 }
 
 /// A vec of `n` items from `f`, backed by 2 MB pages on Linux where possible. The weights
@@ -82,7 +89,7 @@ pub fn symmetries(c: usize) -> [usize; 8] {
 }
 
 impl NTuple {
-    pub fn new(init: f32, stages: usize, tuples: &[[usize; 6]]) -> Self {
+    pub fn new(init: f32, stages: usize, tuples: &[[usize; WIDTH]]) -> Self {
         assert!(!tuples.is_empty() && tuples.len() <= MAX_TUPLES);
         let cells = tuples
             .iter()
@@ -205,9 +212,10 @@ impl NTuple {
     pub fn save(&self, path: &str) -> std::io::Result<()> {
         let tmp = format!("{path}.tmp");
         let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-        f.write_all(MAGIC_V3)?;
+        f.write_all(MAGIC_V4)?;
         f.write_all(&(self.stages as u32).to_le_bytes())?;
         f.write_all(&(self.tuples.len() as u32).to_le_bytes())?;
+        f.write_all(&[WIDTH as u8])?;
         for t in &self.tuples {
             f.write_all(&t.map(|c| c as u8))?;
         }
@@ -235,11 +243,21 @@ impl NTuple {
             m if m == MAGIC_V1 => (1, TUPLES_4.to_vec()),
             m if m == MAGIC_V2 => (read_u32(&mut f)?, TUPLES_4.to_vec()),
             m if m == MAGIC_V3 => {
+                return Err(std::io::Error::other(
+                    "6-cell (V3) net cannot load into this 7-cell (WIDTH=7) binary; use a 6-cell build",
+                ));
+            }
+            m if m == MAGIC_V4 => {
                 let stages = read_u32(&mut f)?;
                 let n = read_u32(&mut f)?;
+                let mut wbuf = [0u8; 1];
+                f.read_exact(&mut wbuf)?;
+                if wbuf[0] as usize != WIDTH {
+                    return Err(std::io::Error::other("net tuple width does not match this binary's WIDTH"));
+                }
                 let mut tuples = vec![];
                 for _ in 0..n {
-                    let mut t = [0u8; 6];
+                    let mut t = [0u8; WIDTH];
                     f.read_exact(&mut t)?;
                     tuples.push(t.map(|c| c as usize));
                 }

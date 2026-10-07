@@ -418,7 +418,7 @@ fn train(args: &[String]) {
     let mut net = match flag::<String>(args, "--resume") {
         Some(p) => NTuple::load(&p).unwrap_or_else(|e| panic!("loading {p}: {e}")),
         None => {
-            let tuples: &[[usize; 6]] = if flag::<u8>(args, "--tuples") == Some(8) { &ntuple::TUPLES_8 } else { &ntuple::TUPLES_4 };
+            let tuples: &[[usize; ntuple::WIDTH]] = if flag::<u8>(args, "--tuples") == Some(8) { &ntuple::TUPLES_8 } else { &ntuple::TUPLES_4 };
             // Optimistic initialization: --init is the starting value of every board, spread
             // evenly over the 8 symmetric lookups of each tuple (320000 in Guei et al.).
             let init: f32 = flag(args, "--init").unwrap_or(0.0);
