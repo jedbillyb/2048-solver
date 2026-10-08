@@ -25,7 +25,7 @@ const USAGE: &str = "usage:
   g2048 worker --url URL --token-file F [--name N] [--threads N] [--cache DIR]
   g2048 boundary GAMES --net FILE --vs FILE                    (both nets' view of the 32768 merge)
   g2048 stages FILE [N]                                        (show, or grow to N stages, a saved net)
-  g2048 train OUT_FILE [games=1000000] [--resume FILE] [--alpha A] [--seed S] [--tc 1] [--stages 3] [--restart 0.5] [--restart-stage 1] [--freeze N] [--tuples 4|8] [--init 320000]";
+  g2048 train OUT_FILE [games=1000000] [--resume FILE] [--alpha A] [--seed S] [--tc 1] [--stages 3] [--restart 0.5] [--restart-stage 1] [--restart-file FILE] [--freeze N] [--tuples 4|8] [--init 320000]";
 
 struct GameResult {
     score: u64,
@@ -436,6 +436,16 @@ fn train(args: &[String]) {
         net.set_frozen(f);
     }
     let pool = ntuple::Pool::new(100_000);
+    // Seed the restart pool from a file of boards (e.g. generated 65536 boards),
+    // so `--restart-stage N` training gets states self-play almost never reaches.
+    // pool_key maps a 65536 board to a stage-3 key, so --restart-stage 3 can then
+    // restart from real 65536 positions and train the 65536 -> 131072 conversion.
+    if let Some(f) = flag::<String>(args, "--restart-file") {
+        let mut rng = Rng(seed ^ 0x5eed_1234);
+        let boards = read_boards(&f);
+        let seeded = boards.iter().filter(|&&b| ntuple::pool_key(b).map(|k| pool.add(k, b, &mut rng)).is_some()).count();
+        println!("seeded restart pool with {seeded}/{} boards from {f}", boards.len());
+    }
     if flag::<u8>(args, "--tc") == Some(1) {
         net.enable_tc();
     }
