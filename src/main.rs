@@ -25,7 +25,7 @@ const USAGE: &str = "usage:
   g2048 worker --url URL --token-file F [--name N] [--threads N] [--cache DIR]
   g2048 boundary GAMES --net FILE --vs FILE                    (both nets' view of the 32768 merge)
   g2048 stages FILE [N]                                        (show, or grow to N stages, a saved net)
-  g2048 train OUT_FILE [games=1000000] [--resume FILE] [--alpha A] [--seed S] [--tc 1] [--stages 3] [--restart 0.5] [--restart-stage 1] [--tuples 4|8] [--init 320000]";
+  g2048 train OUT_FILE [games=1000000] [--resume FILE] [--alpha A] [--seed S] [--tc 1] [--stages 3] [--restart 0.5] [--restart-stage 1] [--freeze N] [--tuples 4|8] [--init 320000]";
 
 struct GameResult {
     score: u64,
@@ -429,6 +429,12 @@ fn train(args: &[String]) {
     net.expand_stages(flag(args, "--stages").unwrap_or(1));
     let restart_p: f32 = flag(args, "--restart").unwrap_or(0.0);
     let restart_stage: usize = flag(args, "--restart-stage").unwrap_or(1);
+    // Keep the lower stages fixed while training a higher one, so sharpening the
+    // top stage (the 65536 regime) can't un-learn the early game (catastrophic
+    // forgetting). --freeze N stops `update` touching stages below N.
+    if let Some(f) = flag::<usize>(args, "--freeze") {
+        net.set_frozen(f);
+    }
     let pool = ntuple::Pool::new(100_000);
     if flag::<u8>(args, "--tc") == Some(1) {
         net.enable_tc();
