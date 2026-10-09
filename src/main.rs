@@ -12,7 +12,7 @@ use std::time::Instant;
 
 const USAGE: &str = "usage:
   g2048 bench [games=16] [seed=1] [--net FILE] [--depth N] [--endgame-depth N] [--top-bias C] [--eval rows|mx] [LOOKUP]
-  g2048 positions OUT_FILE [count=64] --net FILE [--depth 2] [--rank 14]   (boards where the tile first appears)
+  g2048 positions OUT_FILE [count=64] --net FILE [--depth 2] [--rank 14] [--from-file SEEDS]   (boards where the tile first appears; --from-file starts games from seed boards)
   g2048 endgame POS_FILE --net FILE [--depth N] [--cprob P] [LOOKUP]       (play saved boards to the end)
   g2048 formation POS_FILE [--layouts L]                        (which endgame layouts the boards fit)
     LOOKUP: --tables DIR [--layouts block10,five7] [--lookup-rank 15] [--lookup-min P]
@@ -180,11 +180,19 @@ fn positions(args: &[String]) {
     let count: u64 = pos.get(1).and_then(|s| s.parse().ok()).unwrap_or(64);
     let rank: u8 = flag(args, "--rank").unwrap_or(14);
     let ai = Arc::new(net_ai(args, 2));
+    // --from-file: start each game from a random board in this file (e.g. pos32k)
+    // instead of a fresh spawn, so a rank-16 target is reached from one tile away.
+    // Self-play almost never reaches rank 16 from scratch, so this is the only
+    // tractable way to harvest 65536 boards on a small box.
+    let seeds = flag::<String>(args, "--from-file").map(|f| Arc::new(read_boards(&f)));
     // Rarer tiles need more games per board kept.
     let tries = count * if rank >= 15 { 4 } else { 2 };
     let found = parallel(tries, move |i| {
         let mut rng = Rng((5000 + i).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-        let mut b = spawn(spawn(0, &mut rng), &mut rng);
+        let mut b = match &seeds {
+            Some(s) if !s.is_empty() => s[(i as usize) % s.len()],
+            _ => spawn(spawn(0, &mut rng), &mut rng),
+        };
         while let Some(d) = ai.best_move(b) {
             b = spawn(ai.tables().apply(b, d).0, &mut rng);
             if max_rank(b) >= rank {
