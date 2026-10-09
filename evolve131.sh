@@ -36,7 +36,7 @@ DLOG=$NETS/evolve-decisions.log
 STATE=$NETS/evolve131-state.env
 
 log(){ echo "$(date -u +%FT%TZ) [131] $*" | tee -a "$DLOG"; }
-nboards(){ grep -c . "$POS" 2>/dev/null || echo 0; }
+nboards(){ local n; n=$(grep -c . "$POS" 2>/dev/null); echo "${n:-0}"; }
 
 wait_for_ram(){ local floor=$1; while :; do local a; a=$(free -m|awk '/Mem:/{print $7}'); [ "$a" -ge "$floor" ] && return 0; log "RAM $a<$floor MB - holding"; sleep 30; done; }
 
@@ -63,6 +63,7 @@ while :; do
   ENABLED=1; TARGET_BOARDS=150; GEN_COUNT=40; GAMES=250000
   FREEZE=3; RESTART_P=0.9; RESTART_STAGE=3; EVAL_N=60
   GEN_SLEEP=5; RAM_FLOOR_MB=3000
+  GEN_ENDGAME_DEPTH=5; GEN_LAYOUTS=block10  # phase1 reach: mx deep endgame + block10 table (five8 too big for RAM)
   [ -f "$PARAMS" ] && source "$PARAMS"
   [ "$ENABLED" != 1 ] && { log "disabled - idle 60s"; sleep 60; continue; }
   wait_for_ram "$RAM_FLOOR_MB"
@@ -71,7 +72,9 @@ while :; do
   # ---------------- Phase 1: grow the 65536 board library ----------------
   if [ "$nb" -lt "$TARGET_BOARDS" ]; then
     tmp=$(mktemp "$ROOT/.pos65k.XXXX")
-    if guarded "$RAM_FLOOR_MB" "$BIN" positions "$tmp" "$GEN_COUNT" --net "$CHAMP" --rank 16; then
+    if guarded "$RAM_FLOOR_MB" "$BIN" positions "$tmp" "$GEN_COUNT" --net "$CHAMP" --rank 16 \
+         --endgame-eval mx --endgame-rank 15 --endgame-depth "$GEN_ENDGAME_DEPTH" \
+         --tables "$ROOT/tables" --layouts "$GEN_LAYOUTS" --lookup-rank 15; then
       cat "$tmp" >> "$POS"; sort -u "$POS" -o "$POS"
       log "phase1 grow: boards now $(nboards)/$TARGET_BOARDS"
     else
