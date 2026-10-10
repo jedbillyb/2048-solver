@@ -63,7 +63,7 @@ while :; do
   ENABLED=1; TARGET_BOARDS=150; GEN_COUNT=40; GAMES=250000
   FREEZE=3; RESTART_P=0.9; RESTART_STAGE=3; EVAL_N=60
   GEN_SLEEP=5; RAM_FLOOR_MB=3000
-  GEN_ENDGAME_DEPTH=5; GEN_LAYOUTS=five8; GEN_FROM_FILE=$ROOT/pos32k.txt  # phase1: harvest 65536 by playing FROM 32768 seeds with mx + five8 table
+  GEN_ENDGAME_DEPTH=6; GEN_LAYOUTS=five8; GEN_FROM_FILE=  # phase1: fresh full games (empty = no --from-file); pos32k seeds gave 0 over ~1600 games at depth 5+6
   [ -f "$PARAMS" ] && source "$PARAMS"
   [ "$ENABLED" != 1 ] && { log "disabled - idle 60s"; sleep 60; continue; }
   wait_for_ram "$RAM_FLOOR_MB"
@@ -72,8 +72,10 @@ while :; do
   # ---------------- Phase 1: grow the 65536 board library ----------------
   if [ "$nb" -lt "$TARGET_BOARDS" ]; then
     tmp=$(mktemp "$ROOT/.pos65k.XXXX")
+    fromarg=()
+    [ -n "${GEN_FROM_FILE:-}" ] && [ -f "${GEN_FROM_FILE:-}" ] && fromarg=(--from-file "$GEN_FROM_FILE")
     if guarded "$RAM_FLOOR_MB" "$BIN" positions "$tmp" "$GEN_COUNT" --net "$CHAMP" --rank 16 \
-         --from-file "$GEN_FROM_FILE" \
+         ${fromarg[@]+"${fromarg[@]}"} \
          --endgame-eval mx --endgame-rank 15 --endgame-depth "$GEN_ENDGAME_DEPTH" \
          --tables "$ROOT/tables" --layouts "$GEN_LAYOUTS" --lookup-rank 15; then
       cat "$tmp" >> "$POS"; sort -u "$POS" -o "$POS"
